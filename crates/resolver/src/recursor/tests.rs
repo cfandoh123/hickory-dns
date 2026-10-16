@@ -1094,7 +1094,7 @@ mod config {
             DnssecPolicyConfig, ForcedEncryptedAuthoritativeConfig,
             ForcedEncryptedAuthoritativePolicy, ForcedEncryptedAuthoritativePolicyError,
             ForcedEncryptedAuthoritativeProtocol, ForcedEncryptedAuthoritativeServerConfig,
-            ForcedEncryptedAuthoritativeServerPolicy, RecursiveConfig,
+            RecursiveConfig,
         },
     };
 
@@ -1216,15 +1216,15 @@ enabled = {}
 
     #[test]
     fn forced_encrypted_authoritative_policy_matches_by_ip() {
-        let server = ForcedEncryptedAuthoritativeServerPolicy {
-            name: Name::from_ascii("a.root-servers.net.").unwrap(),
-            address: "198.41.0.4".parse().unwrap(),
-            protocol: ForcedEncryptedAuthoritativeProtocol::Dot,
-            trust_anchor: None,
-        };
-        let policy = ForcedEncryptedAuthoritativePolicy::new([server.clone()]);
+        let server = super::policy_validation::server();
+        let address = server.address.unwrap();
+        let policy =
+            ForcedEncryptedAuthoritativePolicy::try_from(ForcedEncryptedAuthoritativeConfig {
+                servers: vec![server.clone()],
+            })
+            .unwrap();
 
-        assert_eq!(policy.server_for(server.address), Some(&server));
+        assert_eq!(policy.server_for(address).unwrap().name, server.name);
         assert_eq!(policy.server_for("198.41.0.5".parse().unwrap()), None);
         assert_eq!(
             policy.protocol_for("198.41.0.4".parse().unwrap()),
@@ -1240,22 +1240,28 @@ enabled = {}
                 name: Name::from_ascii("a.root-servers.net.").unwrap(),
                 address: Some("198.41.0.4".parse().unwrap()),
                 protocol: ForcedEncryptedAuthoritativeProtocol::Dot,
-                trust_anchor: None,
+                trust_anchor: Some(super::TEST_TRUST_ANCHOR.to_owned()),
                 comment: None,
             }],
         };
 
         let policy = ForcedEncryptedAuthoritativePolicy::try_from(config).unwrap();
 
+        let server = policy.server_for("198.41.0.4".parse().unwrap()).unwrap();
         assert_eq!(
-            policy.server_for("198.41.0.4".parse().unwrap()),
-            Some(&ForcedEncryptedAuthoritativeServerPolicy {
-                name: Name::from_ascii("a.root-servers.net.").unwrap(),
-                address: "198.41.0.4".parse().unwrap(),
-                protocol: ForcedEncryptedAuthoritativeProtocol::Dot,
-                trust_anchor: None,
-            })
+            server.name,
+            Name::from_ascii("a.root-servers.net.").unwrap()
         );
+        assert_eq!(
+            server.address,
+            "198.41.0.4".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            server.trust_anchor.as_deref(),
+            Some(super::TEST_TRUST_ANCHOR)
+        );
+        assert_eq!(server.tls_name, "a.root-servers.net");
+        assert_eq!(server.trust_roots.len(), 1);
         assert_eq!(
             policy.protocol_for("198.41.0.4".parse().unwrap()),
             Some(ForcedEncryptedAuthoritativeProtocol::Dot)
@@ -1264,32 +1270,25 @@ enabled = {}
 
     #[test]
     fn forced_encrypted_authoritative_config_preserves_server_fields() {
-        // Trust anchors are opaque strings at this stage, not validated certificates.
-        let input = r#"{"servers":[
-            {"name":"ns.first.test.","address":"192.0.2.1","protocol":"dot",
-             "trust_anchor":"first anchor\nwith a trailing newline\n"},
-            {"name":"ns.second.test.","address":"2001:db8::2","protocol":"doq",
-             "trust_anchor":"second anchor\n"}
-        ]}"#;
-        let config: ForcedEncryptedAuthoritativeConfig = serde_json::from_str(input).unwrap();
+        let first_anchor = super::TEST_TRUST_ANCHOR;
+        let second_anchor = format!("\r\n{}\r\n", first_anchor.replace('\n', "\r\n"));
+        let input = serde_json::json!({"servers":[
+            {"name":"NS.first.test.","address":"192.0.2.1","protocol":"dot",
+             "trust_anchor": first_anchor},
+            {"name":"ns.second.test.","address":"2001:db8::2","protocol":"dot",
+             "trust_anchor": second_anchor}
+        ]});
+        let config: ForcedEncryptedAuthoritativeConfig = serde_json::from_value(input).unwrap();
+        let expected = config.servers.clone();
         let policy = ForcedEncryptedAuthoritativePolicy::try_from(config).unwrap();
 
-        let expected = [
-            ForcedEncryptedAuthoritativeServerPolicy {
-                name: Name::from_ascii("ns.first.test.").unwrap(),
-                address: "192.0.2.1".parse().unwrap(),
-                protocol: ForcedEncryptedAuthoritativeProtocol::Dot,
-                trust_anchor: Some("first anchor\nwith a trailing newline\n".to_owned()),
-            },
-            ForcedEncryptedAuthoritativeServerPolicy {
-                name: Name::from_ascii("ns.second.test.").unwrap(),
-                address: "2001:db8::2".parse().unwrap(),
-                protocol: ForcedEncryptedAuthoritativeProtocol::Doq,
-                trust_anchor: Some("second anchor\n".to_owned()),
-            },
-        ];
-        for server in expected {
-            assert_eq!(policy.server_for(server.address), Some(&server));
+        for expected in expected {
+            let server = policy.server_for(expected.address.unwrap()).unwrap();
+            assert_eq!(server.name.to_ascii(), expected.name.to_ascii());
+            assert_eq!(server.address, expected.address.unwrap());
+            assert_eq!(server.protocol, expected.protocol);
+            assert_eq!(server.trust_anchor, expected.trust_anchor);
+            assert_eq!(server.trust_roots.len(), 1);
             assert_eq!(policy.protocol_for(server.address), Some(server.protocol));
         }
         assert_eq!(policy.server_for("192.0.2.99".parse().unwrap()), None);
@@ -1313,6 +1312,195 @@ enabled = {}
     }
 }
 
+// These existing public certificates exercise parsing, not live TLS validity.
+#[cfg(feature = "serde")]
+const TEST_TRUST_ANCHOR: &str = include_str!("../../../../tests/test-data/ca.pem");
+
+#[cfg(feature = "serde")]
+mod policy_validation {
+    use super::TEST_TRUST_ANCHOR;
+    use crate::{
+        proto::rr::Name,
+        recursor::{
+            ForcedEncryptedAuthoritativeConfig, ForcedEncryptedAuthoritativePolicy,
+            ForcedEncryptedAuthoritativePolicyError as PolicyError,
+            ForcedEncryptedAuthoritativeProtocol as Protocol,
+            ForcedEncryptedAuthoritativeServerConfig as Server,
+        },
+    };
+
+    pub(super) fn server() -> Server {
+        Server {
+            name: Name::from_ascii("a.root-servers.net.").unwrap(),
+            address: Some("198.41.0.4".parse().unwrap()),
+            protocol: Protocol::Dot,
+            trust_anchor: Some(TEST_TRUST_ANCHOR.to_owned()),
+            comment: None,
+        }
+    }
+
+    fn convert(servers: Vec<Server>) -> Result<ForcedEncryptedAuthoritativePolicy, PolicyError> {
+        ForcedEncryptedAuthoritativeConfig { servers }.try_into()
+    }
+
+    #[test]
+    fn empty_policy_is_valid() {
+        assert_eq!(
+            convert(vec![]).unwrap(),
+            ForcedEncryptedAuthoritativePolicy::default()
+        );
+    }
+
+    #[test]
+    fn missing_address_is_rejected() {
+        let mut entry = server();
+        entry.address = None;
+        assert!(matches!(
+            convert(vec![entry]),
+            Err(PolicyError::MissingServerAddress { .. })
+        ));
+    }
+
+    #[test]
+    fn doq_is_rejected_even_when_quic_is_available() {
+        let mut entry = server();
+        entry.protocol = Protocol::Doq;
+        assert!(matches!(
+            convert(vec![entry]),
+            Err(PolicyError::UnsupportedProtocol {
+                protocol: Protocol::Doq,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(not(feature = "__tls"))]
+    #[test]
+    fn dot_is_rejected_without_tls_support() {
+        assert!(matches!(
+            convert(vec![server()]),
+            Err(PolicyError::UnsupportedProtocol {
+                protocol: Protocol::Dot,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "__tls")]
+    #[test]
+    fn missing_or_blank_trust_anchor_is_rejected() {
+        for anchor in [None, Some(""), Some(" \r\n\t")] {
+            let mut entry = server();
+            entry.trust_anchor = anchor.map(str::to_owned);
+            assert!(matches!(
+                convert(vec![entry]),
+                Err(PolicyError::MissingTrustAnchor { .. })
+            ));
+        }
+    }
+
+    #[cfg(feature = "__tls")]
+    #[test]
+    fn malformed_trust_material_is_rejected_including_partial_bundles() {
+        let invalid_der = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----";
+        for anchor in [
+            "not a certificate".to_owned(),
+            "-----BEGIN CERTIFICATE-----\n!invalid base64!\n-----END CERTIFICATE-----".to_owned(),
+            "-----BEGIN CERTIFICATE-----\nAQID".to_owned(),
+            "-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----".to_owned(),
+            invalid_der.to_owned(),
+            format!("-----BEGIN CERTIFICATE-----\n{TEST_TRUST_ANCHOR}"),
+            format!("{TEST_TRUST_ANCHOR}\n{invalid_der}"),
+            format!("{invalid_der}\n{TEST_TRUST_ANCHOR}"),
+            format!("{TEST_TRUST_ANCHOR}\ntrailing junk"),
+            format!("{TEST_TRUST_ANCHOR}\n-----BEGIN CERTIFICATE-----\nAQID"),
+            format!(
+                "{TEST_TRUST_ANCHOR}\n-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----"
+            ),
+        ] {
+            let mut entry = server();
+            entry.trust_anchor = Some(anchor);
+            assert!(matches!(
+                convert(vec![entry]),
+                Err(PolicyError::InvalidTrustAnchor { .. })
+            ));
+        }
+    }
+
+    #[cfg(feature = "__tls")]
+    #[test]
+    fn invalid_tls_identities_are_rejected() {
+        for name in [".", "*.example.test.", "ns_bad.example.test.", "192.0.2.1."] {
+            let mut entry = server();
+            entry.name = Name::from_ascii(name).unwrap();
+            assert!(
+                matches!(
+                    convert(vec![entry]),
+                    Err(PolicyError::InvalidServerName { .. })
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(feature = "__tls")]
+    const SECOND_TRUST_ANCHOR: &str =
+        include_str!("../../../../tests/test-data/test_configs/sec/example.cert.pem");
+
+    #[cfg(feature = "__tls")]
+    #[test]
+    fn conflicting_addresses_and_names_are_rejected_in_either_order() {
+        let original = server();
+        let mut other_name = original.clone();
+        other_name.name = Name::from_ascii("different.example.test.").unwrap();
+        let mut other_trust = original.clone();
+        other_trust.trust_anchor = Some(SECOND_TRUST_ANCHOR.to_owned());
+        let mut other_address_and_trust = other_trust.clone();
+        other_address_and_trust.address = Some("2001:db8::1".parse().unwrap());
+        other_address_and_trust.name = Name::from_ascii("A.ROOT-SERVERS.NET").unwrap();
+
+        for reverse in [false, true] {
+            for conflicting in [&other_name, &other_trust, &other_address_and_trust] {
+                let same_address = original.address == conflicting.address;
+                let mut entries = vec![original.clone(), conflicting.clone()];
+                if reverse {
+                    entries.reverse();
+                }
+                match convert(entries) {
+                    Err(PolicyError::ConflictingServerAddress { .. }) if same_address => {}
+                    Err(PolicyError::ConflictingServerName { .. }) if !same_address => {}
+                    result => panic!("expected policy conflict, got {result:?}"),
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "__tls")]
+    #[test]
+    fn equivalent_duplicates_and_multiple_addresses_are_valid() {
+        let mut original = server();
+        original.trust_anchor = Some(format!("{TEST_TRUST_ANCHOR}\n{SECOND_TRUST_ANCHOR}"));
+        let mut equivalent = original.clone();
+        equivalent.name = Name::from_ascii("A.ROOT-SERVERS.NET").unwrap();
+        equivalent.comment = Some("A note does not change the policy".to_owned());
+        equivalent.trust_anchor = Some(
+            format!("\r\n{SECOND_TRUST_ANCHOR}\n{TEST_TRUST_ANCHOR}\n{TEST_TRUST_ANCHOR}\n")
+                .replace('\n', "\r\n"),
+        );
+        let mut ipv6 = equivalent.clone();
+        ipv6.address = Some("2001:db8::1".parse().unwrap());
+        let policy = convert(vec![original.clone(), equivalent, ipv6.clone()]).unwrap();
+        assert_eq!(policy.servers.len(), 2);
+        for entry in [original, ipv6] {
+            let retained = policy.server_for(entry.address.unwrap()).unwrap();
+            assert_eq!(retained.tls_name, "a.root-servers.net");
+            assert_eq!(retained.name.to_ascii(), entry.name.to_ascii());
+            assert_eq!(retained.trust_anchor, entry.trust_anchor);
+            assert_eq!(retained.trust_roots.len(), 2);
+        }
+    }
+}
+
 #[cfg(feature = "serde")]
 mod policy_wiring {
     use std::{
@@ -1327,16 +1515,16 @@ mod policy_wiring {
     };
     use crate::{
         net::xfer::Protocol,
-        recursor::{
-            DnssecPolicy, DnssecPolicyConfig, ForcedEncryptedAuthoritativeProtocol,
-            ForcedEncryptedAuthoritativeServerPolicy, RecursiveConfig, handle::RecursorDnsHandle,
-        },
+        recursor::{DnssecPolicy, DnssecPolicyConfig, RecursiveConfig, handle::RecursorDnsHandle},
     };
 
-    const POLICY_JSON: &str = r#"{"servers":[{
-        "name":"ns.hickory-dns.testing.","address":"10.0.3.1","protocol":"dot",
-        "trust_anchor":"retained test anchor\n"
-    }]}"#;
+    fn policy_json() -> String {
+        serde_json::json!({"servers":[{
+            "name":"ns.hickory-dns.testing.","address":"10.0.3.1","protocol":"dot",
+            "trust_anchor": super::TEST_TRUST_ANCHOR
+        }]})
+        .to_string()
+    }
 
     struct ConfigFiles(PathBuf);
 
@@ -1395,18 +1583,25 @@ mod policy_wiring {
         }
     }
 
+    #[cfg(feature = "__tls")]
     fn assert_retained_policy(recursor: &Recursor<MockProvider>) {
         let handle = lookup_handle(recursor);
         let server = handle.authoritative_server_policy(LEAF_IP).unwrap();
         assert_eq!(
-            server,
-            &ForcedEncryptedAuthoritativeServerPolicy {
-                name: Name::from_ascii("ns.hickory-dns.testing.").unwrap(),
-                address: LEAF_IP,
-                protocol: ForcedEncryptedAuthoritativeProtocol::Dot,
-                trust_anchor: Some("retained test anchor\n".to_owned()),
-            }
+            server.name,
+            Name::from_ascii("ns.hickory-dns.testing.").unwrap()
         );
+        assert_eq!(server.address, LEAF_IP);
+        assert_eq!(
+            server.protocol,
+            crate::recursor::ForcedEncryptedAuthoritativeProtocol::Dot
+        );
+        assert_eq!(
+            server.trust_anchor.as_deref(),
+            Some(super::TEST_TRUST_ANCHOR)
+        );
+        assert_eq!(server.tls_name, "ns.hickory-dns.testing");
+        assert_eq!(server.trust_roots.len(), 1);
         assert_eq!(handle.authoritative_server_policy(ROOT_IP), None);
 
         let cloned = handle.clone();
@@ -1416,15 +1611,16 @@ mod policy_wiring {
         ));
     }
 
+    #[cfg(feature = "__tls")]
     #[test]
     fn from_config_retains_authoritative_policy() {
         let (recursor, _) =
-            configured_recursor(Some(POLICY_JSON), DnssecPolicyConfig::SecurityUnaware);
+            configured_recursor(Some(&policy_json()), DnssecPolicyConfig::SecurityUnaware);
         assert!(!recursor.is_validating());
         assert_retained_policy(&recursor);
     }
 
-    #[cfg(feature = "__dnssec")]
+    #[cfg(all(feature = "__dnssec", feature = "__tls"))]
     #[test]
     fn from_config_retains_authoritative_policy_in_dnssec_modes() {
         for (dnssec_policy, validates) in [
@@ -1439,7 +1635,7 @@ mod policy_wiring {
                 true,
             ),
         ] {
-            let (recursor, _) = configured_recursor(Some(POLICY_JSON), dnssec_policy);
+            let (recursor, _) = configured_recursor(Some(&policy_json()), dnssec_policy);
             assert_eq!(recursor.is_validating(), validates);
             assert_retained_policy(&recursor);
         }
@@ -1447,8 +1643,14 @@ mod policy_wiring {
 
     #[tokio::test]
     async fn from_config_keeps_existing_dns_behavior_with_or_without_policy() {
-        // This step only wires policy data; transport enforcement comes later.
-        for policy in [None, Some(POLICY_JSON)] {
+        // Startup validation does not yet enforce the connection policy.
+        #[cfg(feature = "__tls")]
+        let json = policy_json();
+        for policy in [
+            None,
+            #[cfg(feature = "__tls")]
+            Some(json.as_str()),
+        ] {
             let (recursor, provider) =
                 configured_recursor(policy, DnssecPolicyConfig::SecurityUnaware);
             assert_eq!(
@@ -1474,6 +1676,65 @@ mod policy_wiring {
             );
             assert!(provider.count_new_connection_calls(LEAF_IP, Protocol::Udp) > 0);
             assert!(provider.count_new_connection_calls(LEAF_IP, Protocol::Tcp) > 0);
+        }
+    }
+
+    #[test]
+    fn from_config_rejects_invalid_policies_before_connecting() {
+        let base: serde_json::Value = serde_json::from_str(&policy_json()).unwrap();
+        let mut cases = vec![];
+        let mut doq = base.clone();
+        doq["servers"][0]["protocol"] = "doq".into();
+        cases.push((doq.to_string(), "unsupported required protocol"));
+        let mut missing_address = base.clone();
+        missing_address["servers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("address");
+        cases.push((missing_address.to_string(), "missing address"));
+        cases.push((
+            "{invalid JSON".to_owned(),
+            "failed to parse authoritative encryption policy",
+        ));
+        #[cfg(not(feature = "__tls"))]
+        cases.push((base.to_string(), "unsupported required protocol"));
+        #[cfg(feature = "__tls")]
+        {
+            let mut missing_trust = base.clone();
+            missing_trust["servers"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("trust_anchor");
+            cases.push((missing_trust.to_string(), "missing trust anchor"));
+            let mut bad_trust = base.clone();
+            bad_trust["servers"][0]["trust_anchor"] = "bad PEM".into();
+            cases.push((bad_trust.to_string(), "invalid trust anchor"));
+            let mut bad_name = base.clone();
+            bad_name["servers"][0]["name"] = "*.example.test.".into();
+            cases.push((bad_name.to_string(), "invalid TLS DNS name"));
+            let mut duplicate = base["servers"][0].clone();
+            duplicate["name"] = "another.example.test.".into();
+            let conflict = serde_json::json!({"servers":[base["servers"][0], duplicate]});
+            cases.push((
+                conflict.to_string(),
+                "conflicting authoritative encryption policies",
+            ));
+        }
+        for (json, expected_error) in cases {
+            let files = ConfigFiles::new(Some(&json));
+            let (provider, options) = test_fixture().unwrap();
+            let config = RecursiveConfig {
+                roots: "root.hints".into(),
+                forced_encrypted_authoritatives: Some("servers.json".into()),
+                dnssec_policy: DnssecPolicyConfig::SecurityUnaware,
+                options,
+            };
+            let error = match Recursor::from_config(config, Some(&files.0), provider.clone()) {
+                Ok(_) => panic!("invalid policy unexpectedly started the resolver"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(expected_error), "{error}");
+            assert!(provider.new_connection_calls().is_empty());
         }
     }
 

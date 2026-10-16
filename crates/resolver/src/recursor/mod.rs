@@ -23,6 +23,11 @@ use std::{
 };
 
 use ipnet::IpNet;
+#[cfg(all(feature = "serde", feature = "__tls"))]
+use rustls::{
+    RootCertStore,
+    pki_types::{CertificateDer, DnsName, TrustAnchor, pem::PemObject},
+};
 #[cfg(feature = "serde")]
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -678,7 +683,7 @@ pub struct ForcedEncryptedAuthoritativeServerConfig {
     pub address: Option<IpAddr>,
     /// Required encrypted transport protocol
     pub protocol: ForcedEncryptedAuthoritativeProtocol,
-    /// Trust anchor key material
+    /// PEM-encoded CA certificates, required when converting to a runtime policy.
     #[serde(default)]
     pub trust_anchor: Option<String>,
     /// Human-readable note
@@ -702,7 +707,9 @@ impl TryFrom<ForcedEncryptedAuthoritativeConfig> for ForcedEncryptedAuthoritativ
     type Error = ForcedEncryptedAuthoritativePolicyError;
 
     fn try_from(config: ForcedEncryptedAuthoritativeConfig) -> Result<Self, Self::Error> {
-        let mut servers = Vec::with_capacity(config.servers.len());
+        let mut servers: HashMap<IpAddr, ForcedEncryptedAuthoritativeServerPolicy> =
+            HashMap::with_capacity(config.servers.len());
+        let mut names = HashMap::new();
 
         for server in config.servers {
             let Some(server_ip_addr) = server.address else {
@@ -713,15 +720,131 @@ impl TryFrom<ForcedEncryptedAuthoritativeConfig> for ForcedEncryptedAuthoritativ
                 );
             };
 
-            servers.push(ForcedEncryptedAuthoritativeServerPolicy {
+            // Strict DoQ is deferred, even if opportunistic QUIC is compiled in.
+            if server.protocol != ForcedEncryptedAuthoritativeProtocol::Dot
+                || !cfg!(feature = "__tls")
+            {
+                return Err(
+                    ForcedEncryptedAuthoritativePolicyError::UnsupportedProtocol {
+                        name: server.name,
+                        protocol: server.protocol,
+                    },
+                );
+            }
+
+            // Keep the configured DNS name, but use a canonical TLS identity for
+            // SNI and conflict detection (DNS case and a final dot are immaterial).
+            let tls_name = server
+                .name
+                .to_ascii()
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            #[cfg(feature = "__tls")]
+            if tls_name.contains('_') || DnsName::try_from(tls_name.as_str()).is_err() {
+                return Err(ForcedEncryptedAuthoritativePolicyError::InvalidServerName {
+                    name: server.name,
+                });
+            }
+
+            #[cfg(feature = "__tls")]
+            let trust_roots = server.parse_trust_anchor()?;
+
+            let server = ForcedEncryptedAuthoritativeServerPolicy {
                 name: server.name,
                 address: server_ip_addr,
                 protocol: server.protocol,
                 trust_anchor: server.trust_anchor,
-            });
+                tls_name,
+                #[cfg(feature = "__tls")]
+                trust_roots,
+            };
+
+            if let Some(previous) = servers.get(&server.address) {
+                if previous.tls_name != server.tls_name || !previous.same_trust_policy(&server) {
+                    return Err(
+                        ForcedEncryptedAuthoritativePolicyError::ConflictingServerAddress {
+                            address: server.address,
+                        },
+                    );
+                }
+                // Repeated identical entries do not change the policy.
+                continue;
+            }
+            if let Some(previous_address) = names.get(&server.tls_name) {
+                let previous = &servers[previous_address];
+                if !previous.same_trust_policy(&server) {
+                    return Err(
+                        ForcedEncryptedAuthoritativePolicyError::ConflictingServerName {
+                            name: server.name,
+                        },
+                    );
+                }
+            }
+            names.insert(server.tls_name.clone(), server.address);
+            servers.insert(server.address, server);
         }
 
-        Ok(ForcedEncryptedAuthoritativePolicy::new(servers))
+        Ok(Self { servers })
+    }
+}
+
+#[cfg(all(feature = "serde", feature = "__tls"))]
+impl ForcedEncryptedAuthoritativeServerConfig {
+    fn parse_trust_anchor(
+        &self,
+    ) -> Result<Vec<TrustAnchor<'static>>, ForcedEncryptedAuthoritativePolicyError> {
+        let mut remaining = self
+            .trust_anchor
+            .as_deref()
+            .map(str::trim)
+            .filter(|pem| !pem.is_empty())
+            .ok_or_else(
+                || ForcedEncryptedAuthoritativePolicyError::MissingTrustAnchor {
+                    name: self.name.clone(),
+                },
+            )?;
+        let invalid = |reason| ForcedEncryptedAuthoritativePolicyError::InvalidTrustAnchor {
+            name: self.name.clone(),
+            reason,
+        };
+        let mut roots = RootCertStore::empty();
+        const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+        const END: &str = "-----END CERTIFICATE-----";
+
+        // Accept a certificate or bundle. Require every block to be a certificate:
+        // the generic PEM iterator would silently skip other items and plain text.
+        while !remaining.is_empty() {
+            if !remaining.starts_with(BEGIN) {
+                return Err(invalid("expected a PEM CERTIFICATE block".to_owned()));
+            }
+            let end = remaining
+                .find(END)
+                .ok_or_else(|| invalid("unterminated PEM CERTIFICATE block".to_owned()))?
+                + END.len();
+            let (pem, rest) = remaining.split_at(end);
+            if pem[BEGIN.len()..].contains("-----BEGIN ") {
+                return Err(invalid(
+                    "nested PEM block before certificate end".to_owned(),
+                ));
+            }
+            let certificate = CertificateDer::from_pem_slice(pem.as_bytes())
+                .map_err(|_| invalid("malformed PEM certificate".to_owned()))?;
+            // Unlike add_parsable_certificates, add rejects each malformed DER
+            // certificate instead of silently retaining only the valid ones.
+            // Peer chain, hostname, and validity checks belong to the later TLS
+            // handshake; this only parses locally supplied trust anchors.
+            roots
+                .add(certificate)
+                .map_err(|error| invalid(format!("invalid trust certificate: {error}")))?;
+            remaining = rest.trim();
+        }
+        let mut unique_roots = Vec::with_capacity(roots.len());
+        for root in roots.roots {
+            if !unique_roots.contains(&root) {
+                unique_roots.push(root);
+            }
+        }
+        Ok(unique_roots)
     }
 }
 
@@ -735,6 +858,48 @@ pub enum ForcedEncryptedAuthoritativePolicyError {
         /// Server name from the policy
         name: Name,
     },
+    /// The required transport is not supported by this implementation/build.
+    #[error(
+        "unsupported required protocol {protocol:?} for authoritative server {name}: only DoT with TLS enabled is supported"
+    )]
+    UnsupportedProtocol {
+        /// Server name from the policy
+        name: Name,
+        /// Required protocol from the policy
+        protocol: ForcedEncryptedAuthoritativeProtocol,
+    },
+    /// The server name is not a concrete DNS hostname usable for TLS.
+    #[error("invalid TLS DNS name for authoritative server {name}")]
+    InvalidServerName {
+        /// Server name from the policy
+        name: Name,
+    },
+    /// No trust certificates were supplied.
+    #[error("missing trust anchor for authoritative server {name}: supply PEM CA certificates")]
+    MissingTrustAnchor {
+        /// Server name from the policy
+        name: Name,
+    },
+    /// Trust material could not be parsed as TLS trust certificates.
+    #[error("invalid trust anchor for authoritative server {name}: {reason}")]
+    InvalidTrustAnchor {
+        /// Server name from the policy
+        name: Name,
+        /// Parsing error, without the supplied certificate contents
+        reason: String,
+    },
+    /// An IP address has incompatible identities or trust requirements.
+    #[error("conflicting authoritative encryption policies for address {address}")]
+    ConflictingServerAddress {
+        /// Address shared by conflicting entries
+        address: IpAddr,
+    },
+    /// Multiple addresses for one server specify incompatible trust requirements.
+    #[error("conflicting authoritative encryption policies for server name {name}")]
+    ConflictingServerName {
+        /// Server name shared by conflicting entries
+        name: Name,
+    },
 }
 
 /// Runtime policy for one authoritative server with a known address.
@@ -744,8 +909,36 @@ pub(crate) struct ForcedEncryptedAuthoritativeServerPolicy {
     pub(crate) name: Name,
     pub(crate) address: IpAddr,
     pub(crate) protocol: ForcedEncryptedAuthoritativeProtocol,
-    /// Retained as configured; certificate validation is a separate step.
+    /// Original PEM text, retained alongside the parsed trust roots.
     pub(crate) trust_anchor: Option<String>,
+    /// Validated, lowercase DNS identity without a trailing dot.
+    pub(crate) tls_name: String,
+    /// Parsed once at startup; contains only explicitly configured trust anchors.
+    #[cfg(feature = "__tls")]
+    pub(crate) trust_roots: Vec<TrustAnchor<'static>>,
+}
+
+#[cfg(feature = "serde")]
+impl ForcedEncryptedAuthoritativeServerPolicy {
+    fn same_trust_policy(&self, other: &Self) -> bool {
+        if self.protocol != other.protocol {
+            return false;
+        }
+        #[cfg(feature = "__tls")]
+        {
+            // PEM formatting, certificate order, and duplicate certificates do
+            // not change the set of trusted issuers.
+            self.trust_roots.len() == other.trust_roots.len()
+                && self
+                    .trust_roots
+                    .iter()
+                    .all(|root| other.trust_roots.contains(root))
+        }
+        #[cfg(not(feature = "__tls"))]
+        {
+            self.trust_anchor == other.trust_anchor
+        }
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -756,17 +949,6 @@ pub(crate) struct ForcedEncryptedAuthoritativePolicy {
 
 #[cfg(feature = "serde")]
 impl ForcedEncryptedAuthoritativePolicy {
-    pub(crate) fn new(
-        servers: impl IntoIterator<Item = ForcedEncryptedAuthoritativeServerPolicy>,
-    ) -> Self {
-        Self {
-            servers: servers
-                .into_iter()
-                .map(|server| (server.address, server))
-                .collect(),
-        }
-    }
-
     pub(crate) fn server_for(
         &self,
         ip: IpAddr,
