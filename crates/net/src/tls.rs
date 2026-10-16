@@ -56,15 +56,14 @@ pub async fn tls_exchange<P: RuntimeProvider<Tcp = S>, S: DnsTcpStream>(
     remote_addr: SocketAddr,
     bind_addr: Option<SocketAddr>,
     server_name: ServerName<'static>,
-    mut config: ClientConfig,
+    config: ClientConfig,
     timeout: Duration,
     connect_timeout: Duration,
     max_active_requests: Option<usize>,
     provider: P,
 ) -> Result<DnsExchange<P>, NetError> {
-    // The port (853) of DOT is for dns dedicated, SNI is unnecessary. (ISP block by the SNI name)
-    config.enable_sni = false;
-
+    // Honor the caller's SNI setting. Authenticated endpoints can require their
+    // configured DNS identity for virtual hosting as well as certificate checks.
     let stream = provider
         .connect_tcp(remote_addr, bind_addr, Some(connect_timeout))
         .await?;

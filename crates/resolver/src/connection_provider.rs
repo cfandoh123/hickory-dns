@@ -24,7 +24,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 #[cfg(feature = "__tls")]
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-#[cfg(not(feature = "__tls"))]
+#[cfg(feature = "__tls")]
+use tracing::debug;
 use tracing::warn;
 
 #[cfg(feature = "__h3")]
@@ -115,7 +116,9 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
                 };
 
                 let server_name = server_name.to_owned();
-                Ok(Box::pin(tls_exchange(
+                let expected_name = server_name.to_str().into_owned();
+                let required = cx.server_tls_configs.contains_key(&ip);
+                let connecting = tls_exchange(
                     remote_addr,
                     config.bind_addr,
                     server_name,
@@ -124,7 +127,21 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
                     cx.options.connect_timeout,
                     Some(cx.options.max_active_requests),
                     self.clone(),
-                )))
+                );
+                Ok(Box::pin(async move {
+                    let result = connecting.await;
+                    if required {
+                        match &result {
+                            Ok(_) => {
+                                debug!(%ip, %expected_name, "authenticated authoritative DoT connected")
+                            }
+                            Err(error) => {
+                                warn!(%ip, %expected_name, %error, "required authoritative DoT connection failed")
+                            }
+                        }
+                    }
+                    result
+                }))
             }
             #[cfg(feature = "__https")]
             (ProtocolConfig::Https { server_name, path }, _) => {
@@ -226,6 +243,9 @@ impl TlsConfig {
     /// encryption which requires the peer certificate not be verified.
     #[cfg(feature = "__tls")]
     pub fn insecure_skip_verify(&mut self) {
+        // Opportunistic connections do not assert a DNS server identity. Keep
+        // their SNI disabled without changing authenticated endpoints' settings.
+        self.config.enable_sni = false;
         self.config
             .dangerous()
             .set_certificate_verifier(Arc::new(NoCertificateVerification::default()))

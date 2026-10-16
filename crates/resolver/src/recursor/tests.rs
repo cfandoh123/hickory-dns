@@ -22,6 +22,9 @@ use crate::{
     recursor::QNameMinimization,
 };
 
+#[cfg(all(feature = "serde", feature = "__tls"))]
+mod authenticated_dot;
+
 #[tokio::test]
 async fn recursor_connection_deduplication() -> Result<(), NetError> {
     subscribe();
