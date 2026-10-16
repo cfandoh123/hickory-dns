@@ -1094,7 +1094,7 @@ mod config {
             DnssecPolicyConfig, ForcedEncryptedAuthoritativeConfig,
             ForcedEncryptedAuthoritativePolicy, ForcedEncryptedAuthoritativePolicyError,
             ForcedEncryptedAuthoritativeProtocol, ForcedEncryptedAuthoritativeServerConfig,
-            RecursiveConfig,
+            ForcedEncryptedAuthoritativeServerPolicy, RecursiveConfig,
         },
     };
 
@@ -1216,11 +1216,16 @@ enabled = {}
 
     #[test]
     fn forced_encrypted_authoritative_policy_matches_by_ip() {
-        let policy = ForcedEncryptedAuthoritativePolicy::new([(
-            "198.41.0.4".parse().unwrap(),
-            ForcedEncryptedAuthoritativeProtocol::Dot,
-        )]);
+        let server = ForcedEncryptedAuthoritativeServerPolicy {
+            name: Name::from_ascii("a.root-servers.net.").unwrap(),
+            address: "198.41.0.4".parse().unwrap(),
+            protocol: ForcedEncryptedAuthoritativeProtocol::Dot,
+            trust_anchor: None,
+        };
+        let policy = ForcedEncryptedAuthoritativePolicy::new([server.clone()]);
 
+        assert_eq!(policy.server_for(server.address), Some(&server));
+        assert_eq!(policy.server_for("198.41.0.5".parse().unwrap()), None);
         assert_eq!(
             policy.protocol_for("198.41.0.4".parse().unwrap()),
             Some(ForcedEncryptedAuthoritativeProtocol::Dot)
@@ -1243,9 +1248,51 @@ enabled = {}
         let policy = ForcedEncryptedAuthoritativePolicy::try_from(config).unwrap();
 
         assert_eq!(
+            policy.server_for("198.41.0.4".parse().unwrap()),
+            Some(&ForcedEncryptedAuthoritativeServerPolicy {
+                name: Name::from_ascii("a.root-servers.net.").unwrap(),
+                address: "198.41.0.4".parse().unwrap(),
+                protocol: ForcedEncryptedAuthoritativeProtocol::Dot,
+                trust_anchor: None,
+            })
+        );
+        assert_eq!(
             policy.protocol_for("198.41.0.4".parse().unwrap()),
             Some(ForcedEncryptedAuthoritativeProtocol::Dot)
         );
+    }
+
+    #[test]
+    fn forced_encrypted_authoritative_config_preserves_server_fields() {
+        // Trust anchors are opaque strings at this stage, not validated certificates.
+        let input = r#"{"servers":[
+            {"name":"ns.first.test.","address":"192.0.2.1","protocol":"dot",
+             "trust_anchor":"first anchor\nwith a trailing newline\n"},
+            {"name":"ns.second.test.","address":"2001:db8::2","protocol":"doq",
+             "trust_anchor":"second anchor\n"}
+        ]}"#;
+        let config: ForcedEncryptedAuthoritativeConfig = serde_json::from_str(input).unwrap();
+        let policy = ForcedEncryptedAuthoritativePolicy::try_from(config).unwrap();
+
+        let expected = [
+            ForcedEncryptedAuthoritativeServerPolicy {
+                name: Name::from_ascii("ns.first.test.").unwrap(),
+                address: "192.0.2.1".parse().unwrap(),
+                protocol: ForcedEncryptedAuthoritativeProtocol::Dot,
+                trust_anchor: Some("first anchor\nwith a trailing newline\n".to_owned()),
+            },
+            ForcedEncryptedAuthoritativeServerPolicy {
+                name: Name::from_ascii("ns.second.test.").unwrap(),
+                address: "2001:db8::2".parse().unwrap(),
+                protocol: ForcedEncryptedAuthoritativeProtocol::Doq,
+                trust_anchor: Some("second anchor\n".to_owned()),
+            },
+        ];
+        for server in expected {
+            assert_eq!(policy.server_for(server.address), Some(&server));
+            assert_eq!(policy.protocol_for(server.address), Some(server.protocol));
+        }
+        assert_eq!(policy.server_for("192.0.2.99".parse().unwrap()), None);
     }
 
     #[test]

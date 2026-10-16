@@ -678,7 +678,7 @@ impl TryFrom<ForcedEncryptedAuthoritativeConfig> for ForcedEncryptedAuthoritativ
     type Error = ForcedEncryptedAuthoritativePolicyError;
 
     fn try_from(config: ForcedEncryptedAuthoritativeConfig) -> Result<Self, Self::Error> {
-        let mut servers_map = HashMap::new();
+        let mut servers = Vec::with_capacity(config.servers.len());
 
         for server in config.servers {
             let Some(server_ip_addr) = server.address else {
@@ -689,10 +689,15 @@ impl TryFrom<ForcedEncryptedAuthoritativeConfig> for ForcedEncryptedAuthoritativ
                 );
             };
 
-            servers_map.insert(server_ip_addr, server.protocol);
+            servers.push(ForcedEncryptedAuthoritativeServerPolicy {
+                name: server.name,
+                address: server_ip_addr,
+                protocol: server.protocol,
+                trust_anchor: server.trust_anchor,
+            });
         }
 
-        Ok(ForcedEncryptedAuthoritativePolicy::new(servers_map))
+        Ok(ForcedEncryptedAuthoritativePolicy::new(servers))
     }
 }
 
@@ -708,24 +713,45 @@ pub enum ForcedEncryptedAuthoritativePolicyError {
     },
 }
 
+/// Runtime policy for one authoritative server with a known address.
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ForcedEncryptedAuthoritativeServerPolicy {
+    pub(crate) name: Name,
+    pub(crate) address: IpAddr,
+    pub(crate) protocol: ForcedEncryptedAuthoritativeProtocol,
+    /// Retained as configured; certificate validation is a separate step.
+    pub(crate) trust_anchor: Option<String>,
+}
+
 #[cfg(feature = "serde")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ForcedEncryptedAuthoritativePolicy {
-    servers: HashMap<IpAddr, ForcedEncryptedAuthoritativeProtocol>,
+    servers: HashMap<IpAddr, ForcedEncryptedAuthoritativeServerPolicy>,
 }
 
 #[cfg(feature = "serde")]
 impl ForcedEncryptedAuthoritativePolicy {
     pub(crate) fn new(
-        servers: impl IntoIterator<Item = (IpAddr, ForcedEncryptedAuthoritativeProtocol)>,
+        servers: impl IntoIterator<Item = ForcedEncryptedAuthoritativeServerPolicy>,
     ) -> Self {
         Self {
-            servers: servers.into_iter().collect(),
+            servers: servers
+                .into_iter()
+                .map(|server| (server.address, server))
+                .collect(),
         }
     }
 
+    pub(crate) fn server_for(
+        &self,
+        ip: IpAddr,
+    ) -> Option<&ForcedEncryptedAuthoritativeServerPolicy> {
+        self.servers.get(&ip)
+    }
+
     pub(crate) fn protocol_for(&self, ip: IpAddr) -> Option<ForcedEncryptedAuthoritativeProtocol> {
-        self.servers.get(&ip).copied()
+        self.server_for(ip).map(|server| server.protocol)
     }
 }
 
