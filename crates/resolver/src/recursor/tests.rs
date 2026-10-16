@@ -1313,6 +1313,185 @@ enabled = {}
     }
 }
 
+#[cfg(feature = "serde")]
+mod policy_wiring {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::{
+        LEAF_IP, MockProvider, Name, Query, ROOT_IP, RecordType, Recursor, RecursorMode,
+        ResponseCode, test_fixture,
+    };
+    use crate::{
+        net::xfer::Protocol,
+        recursor::{
+            DnssecPolicy, DnssecPolicyConfig, ForcedEncryptedAuthoritativeProtocol,
+            ForcedEncryptedAuthoritativeServerPolicy, RecursiveConfig, handle::RecursorDnsHandle,
+        },
+    };
+
+    const POLICY_JSON: &str = r#"{"servers":[{
+        "name":"ns.hickory-dns.testing.","address":"10.0.3.1","protocol":"dot",
+        "trust_anchor":"retained test anchor\n"
+    }]}"#;
+
+    struct ConfigFiles(PathBuf);
+
+    impl ConfigFiles {
+        fn new(policy: Option<&str>) -> Self {
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "hickory-policy-wiring-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            let files = Self(path);
+            fs::write(
+                files.0.join("root.hints"),
+                format!(". 3600 IN NS root.testing.\nroot.testing. 3600 IN A {ROOT_IP}\n"),
+            )
+            .unwrap();
+            if let Some(policy) = policy {
+                fs::write(files.0.join("servers.json"), policy).unwrap();
+            }
+            files
+        }
+    }
+
+    impl Drop for ConfigFiles {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.0.join("servers.json"));
+            let _ = fs::remove_file(self.0.join("root.hints"));
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+
+    fn configured_recursor(
+        policy: Option<&str>,
+        dnssec_policy: DnssecPolicyConfig,
+    ) -> (Recursor<MockProvider>, MockProvider) {
+        let files = ConfigFiles::new(policy);
+        let (provider, options) = test_fixture().unwrap();
+        let config = RecursiveConfig {
+            roots: "root.hints".into(),
+            forced_encrypted_authoritatives: policy.map(|_| "servers.json".into()),
+            dnssec_policy,
+            options,
+        };
+        let recursor = Recursor::from_config(config, Some(&files.0), provider.clone()).unwrap();
+        // The resolver must own its policy after the configuration files are removed.
+        (recursor, provider)
+    }
+
+    fn lookup_handle(recursor: &Recursor<MockProvider>) -> &RecursorDnsHandle<MockProvider> {
+        match &recursor.mode {
+            RecursorMode::NonValidating { handle } => handle,
+            #[cfg(feature = "__dnssec")]
+            RecursorMode::Validating(validating) => validating.handle.inner(),
+        }
+    }
+
+    fn assert_retained_policy(recursor: &Recursor<MockProvider>) {
+        let handle = lookup_handle(recursor);
+        let server = handle.authoritative_server_policy(LEAF_IP).unwrap();
+        assert_eq!(
+            server,
+            &ForcedEncryptedAuthoritativeServerPolicy {
+                name: Name::from_ascii("ns.hickory-dns.testing.").unwrap(),
+                address: LEAF_IP,
+                protocol: ForcedEncryptedAuthoritativeProtocol::Dot,
+                trust_anchor: Some("retained test anchor\n".to_owned()),
+            }
+        );
+        assert_eq!(handle.authoritative_server_policy(ROOT_IP), None);
+
+        let cloned = handle.clone();
+        assert!(std::ptr::eq(
+            server,
+            cloned.authoritative_server_policy(LEAF_IP).unwrap()
+        ));
+    }
+
+    #[test]
+    fn from_config_retains_authoritative_policy() {
+        let (recursor, _) =
+            configured_recursor(Some(POLICY_JSON), DnssecPolicyConfig::SecurityUnaware);
+        assert!(!recursor.is_validating());
+        assert_retained_policy(&recursor);
+    }
+
+    #[cfg(feature = "__dnssec")]
+    #[test]
+    fn from_config_retains_authoritative_policy_in_dnssec_modes() {
+        for (dnssec_policy, validates) in [
+            (DnssecPolicyConfig::ValidationDisabled, false),
+            (
+                DnssecPolicyConfig::ValidateWithStaticKey {
+                    path: None,
+                    nsec3_soft_iteration_limit: None,
+                    nsec3_hard_iteration_limit: None,
+                    validation_cache_size: None,
+                },
+                true,
+            ),
+        ] {
+            let (recursor, _) = configured_recursor(Some(POLICY_JSON), dnssec_policy);
+            assert_eq!(recursor.is_validating(), validates);
+            assert_retained_policy(&recursor);
+        }
+    }
+
+    #[tokio::test]
+    async fn from_config_keeps_existing_dns_behavior_with_or_without_policy() {
+        // This step only wires policy data; transport enforcement comes later.
+        for policy in [None, Some(POLICY_JSON)] {
+            let (recursor, provider) =
+                configured_recursor(policy, DnssecPolicyConfig::SecurityUnaware);
+            assert_eq!(
+                lookup_handle(&recursor)
+                    .authoritative_server_policy(LEAF_IP)
+                    .is_some(),
+                policy.is_some()
+            );
+            let query = Query::new(
+                Name::from_ascii("host.hickory-dns.testing.").unwrap(),
+                RecordType::A,
+            );
+            let response = recursor
+                .resolve(query, std::time::Instant::now(), false)
+                .await
+                .unwrap();
+            assert_eq!(response.response_code, ResponseCode::NoError);
+            assert!(
+                response
+                    .answers
+                    .iter()
+                    .any(|r| r.data.ip_addr() == Some(LEAF_IP))
+            );
+            assert!(provider.count_new_connection_calls(LEAF_IP, Protocol::Udp) > 0);
+            assert!(provider.count_new_connection_calls(LEAF_IP, Protocol::Tcp) > 0);
+        }
+    }
+
+    #[test]
+    fn public_constructors_start_without_authoritative_policy() {
+        let (provider, options) = test_fixture().unwrap();
+        for recursor in [
+            Recursor::with_options(&[ROOT_IP], options.clone(), provider.clone()).unwrap(),
+            Recursor::new(&[ROOT_IP], DnssecPolicy::default(), None, options, provider).unwrap(),
+        ] {
+            assert_eq!(
+                lookup_handle(&recursor).authoritative_server_policy(LEAF_IP),
+                None
+            );
+        }
+    }
+}
+
 const ROOT_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
 const TLD_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
 const LEAF_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 3, 1));

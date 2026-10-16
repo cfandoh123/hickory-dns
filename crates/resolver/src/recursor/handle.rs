@@ -18,6 +18,8 @@ use super::{
     DnssecPolicy, QNameMinimization, RecursorError, RecursorOptions, error::AuthorityData,
     is_subzone,
 };
+#[cfg(feature = "serde")]
+use super::{ForcedEncryptedAuthoritativePolicy, ForcedEncryptedAuthoritativeServerPolicy};
 #[cfg(feature = "metrics")]
 use crate::metrics::recursor::RecursorMetrics;
 #[cfg(feature = "__dnssec")]
@@ -57,6 +59,8 @@ pub(crate) struct RecursorDnsHandle<P: ConnectionProvider> {
     request_options: DnsRequestOptions,
     ttl_config: TtlConfig,
     qname_minimization: QNameMinimization,
+    #[cfg(feature = "serde")]
+    forced_encrypted_authoritative_policy: Option<Arc<ForcedEncryptedAuthoritativePolicy>>,
 }
 
 impl<P: ConnectionProvider> RecursorDnsHandle<P> {
@@ -67,6 +71,9 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         options: RecursorOptions,
         tls: TlsConfig,
         conn_provider: P,
+        #[cfg(feature = "serde")] forced_encrypted_authoritative_policy: Option<
+            Arc<ForcedEncryptedAuthoritativePolicy>,
+        >,
     ) -> Result<Self, RecursorError> {
         assert!(!roots.is_empty(), "roots must not be empty");
         let servers = roots
@@ -157,7 +164,21 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             request_options,
             ttl_config: cache_policy.clone(),
             qname_minimization,
+            #[cfg(feature = "serde")]
+            forced_encrypted_authoritative_policy,
         })
+    }
+
+    /// Look up the retained policy for an authoritative connection.
+    /// Transport selection does not enforce this policy yet.
+    #[cfg(feature = "serde")]
+    pub(super) fn authoritative_server_policy(
+        &self,
+        ip: IpAddr,
+    ) -> Option<&ForcedEncryptedAuthoritativeServerPolicy> {
+        self.forced_encrypted_authoritative_policy
+            .as_ref()
+            .and_then(|policy| policy.server_for(ip))
     }
 
     pub(crate) async fn resolve(

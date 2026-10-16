@@ -89,7 +89,7 @@ impl<P: ConnectionProvider> Recursor<P> {
         let dnssec_policy =
             DnssecPolicy::from_config(&config.dnssec_policy).map_err(|e| e.to_string())?;
 
-        let _forced_encrypted_authoritative_policy = match &config.forced_encrypted_authoritatives {
+        let forced_encrypted_authoritative_policy = match &config.forced_encrypted_authoritatives {
             Some(forced_encrypted_authoritatives) => {
                 let path = match root_dir {
                     Some(root_dir) => Cow::Owned(root_dir.join(forced_encrypted_authoritatives)),
@@ -143,12 +143,13 @@ impl<P: ConnectionProvider> Recursor<P> {
             .filter_map(RData::ip_addr) // we only want IPs
             .collect::<Vec<_>>();
 
-        Self::new(
+        Self::new_with_policy(
             &root_addrs,
             dnssec_policy,
             encrypted_transport_state,
             config.options.clone(),
             conn_provider,
+            forced_encrypted_authoritative_policy.map(Arc::new),
         )
     }
 
@@ -169,6 +170,27 @@ impl<P: ConnectionProvider> Recursor<P> {
         options: RecursorOptions,
         conn_provider: P,
     ) -> Result<Self, RecursorError> {
+        Self::new_with_policy(
+            roots,
+            dnssec_policy,
+            encrypted_transport_state,
+            options,
+            conn_provider,
+            #[cfg(feature = "serde")]
+            None,
+        )
+    }
+
+    fn new_with_policy(
+        roots: &[IpAddr],
+        dnssec_policy: DnssecPolicy,
+        encrypted_transport_state: Option<NameServerTransportState>,
+        options: RecursorOptions,
+        conn_provider: P,
+        #[cfg(feature = "serde")] forced_encrypted_authoritative_policy: Option<
+            Arc<ForcedEncryptedAuthoritativePolicy>,
+        >,
+    ) -> Result<Self, RecursorError> {
         let mut tls_config = TlsConfig::new()?;
         if options.opportunistic_encryption.is_enabled() {
             warn!("disabling TLS peer verification for opportunistic encryption mode");
@@ -186,6 +208,8 @@ impl<P: ConnectionProvider> Recursor<P> {
             options,
             tls_config,
             conn_provider,
+            #[cfg(feature = "serde")]
+            forced_encrypted_authoritative_policy,
         )?;
 
         Ok(Self {
