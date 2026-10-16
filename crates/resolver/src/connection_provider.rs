@@ -119,7 +119,7 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
                     remote_addr,
                     config.bind_addr,
                     server_name,
-                    cx.tls.clone(),
+                    cx.tls_config_for_server(ip).clone(),
                     cx.options.timeout,
                     cx.options.connect_timeout,
                     Some(cx.options.max_active_requests),

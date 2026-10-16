@@ -14,6 +14,8 @@ use lru_cache::LruCache;
 use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
+#[cfg(all(feature = "serde", feature = "__tls"))]
+use super::ForcedEncryptedAuthoritativeProtocol;
 use super::{
     DnssecPolicy, QNameMinimization, RecursorError, RecursorOptions, error::AuthorityData,
     is_subzone,
@@ -79,7 +81,16 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         let servers = roots
             .iter()
             .copied()
-            .map(|ip| name_server_config(ip, &options.opportunistic_encryption))
+            .map(|ip| {
+                name_server_config(
+                    ip,
+                    &options.opportunistic_encryption,
+                    #[cfg(all(feature = "serde", feature = "__tls"))]
+                    forced_encrypted_authoritative_policy
+                        .as_ref()
+                        .and_then(|policy| policy.server_for(ip)),
+                )
+            })
             .collect::<Vec<_>>();
 
         let RecursorOptions {
@@ -130,6 +141,25 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             pool_context = pool_context.with_transport_state(state);
         }
 
+        #[cfg(all(feature = "serde", feature = "__tls"))]
+        if let Some(policy) = &forced_encrypted_authoritative_policy {
+            for server in policy.servers.values() {
+                // Build from the configured anchors alone. In particular, never
+                // clone the shared TLS config: opportunistic mode may have
+                // installed its certificate-verification bypass there.
+                let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+                    crate::net::tls::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .map_err(crate::net::NetError::from)?
+                .with_root_certificates(rustls::RootCertStore {
+                    roots: server.trust_roots.clone(),
+                })
+                .with_no_client_auth();
+                pool_context = pool_context.with_server_tls_config(server.address, tls);
+            }
+        }
+
         let pool_context = Arc::new(pool_context);
         let roots =
             NameServerPool::from_config(servers, pool_context.clone(), conn_provider.clone());
@@ -169,8 +199,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         })
     }
 
-    /// Look up the retained policy for an authoritative connection.
-    /// Transport selection does not enforce this policy yet.
+    /// Look up the validated policy for an authoritative connection.
     #[cfg(feature = "serde")]
     pub(super) fn authoritative_server_policy(
         &self,
@@ -179,6 +208,16 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         self.forced_encrypted_authoritative_policy
             .as_ref()
             .and_then(|policy| policy.server_for(ip))
+    }
+
+    /// Use the same endpoint selection for referral glue and resolved NS addresses.
+    fn name_server_config(&self, ip: IpAddr) -> NameServerConfig {
+        name_server_config(
+            ip,
+            &self.pool_context.opportunistic_encryption,
+            #[cfg(all(feature = "serde", feature = "__tls"))]
+            self.authoritative_server_policy(ip),
+        )
     }
 
     pub(crate) async fn resolve(
@@ -638,9 +677,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
                 match glue_ips.get(&ns_data.0) {
                     Some(glue) if !glue.is_empty() => {
-                        config_group.extend(glue.iter().copied().map(|ip| {
-                            name_server_config(ip, &self.pool_context.opportunistic_encryption)
-                        }));
+                        config_group
+                            .extend(glue.iter().copied().map(|ip| self.name_server_config(ip)));
                     }
                     _ => {
                         debug!(name_server = ?ns_data, "glue not found for name server");
@@ -832,7 +870,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                                 }
                                 Some(ip)
                             }
-                        }).map(|ip| name_server_config(ip, &self.pool_context.opportunistic_encryption)));
+                        }).map(|ip| self.name_server_config(ip)));
                 }
                 Some(Err(e)) => {
                     warn!("append_ips_from_lookup: resolution failed failed: {e}");
@@ -929,7 +967,24 @@ fn recursor_opts(
 fn name_server_config(
     ip: IpAddr,
     opportunistic_encryption: &OpportunisticEncryption,
+    #[cfg(all(feature = "serde", feature = "__tls"))] required: Option<
+        &ForcedEncryptedAuthoritativeServerPolicy,
+    >,
 ) -> NameServerConfig {
+    #[cfg(all(feature = "serde", feature = "__tls"))]
+    if let Some(required) = required {
+        return match required.protocol {
+            ForcedEncryptedAuthoritativeProtocol::Dot => {
+                // This list intentionally has no UDP, plaintext TCP, or QUIC
+                // alternatives, even when opportunistic encryption is enabled.
+                NameServerConfig::tls(ip, Arc::from(required.tls_name.as_str()))
+            }
+            ForcedEncryptedAuthoritativeProtocol::Doq => {
+                unreachable!("required DoQ is rejected during policy validation")
+            }
+        };
+    }
+
     match opportunistic_encryption {
         #[cfg(any(
             feature = "tls-aws-lc-rs",

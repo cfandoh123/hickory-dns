@@ -894,6 +894,12 @@ fn validate_response(response: Message, name: &Name, ip: IpAddr) -> bool {
 }
 
 fn test_fixture() -> Result<(MockProvider, RecursorOptions), NetError> {
+    test_fixture_with_glue(true)
+}
+
+fn test_fixture_with_glue(
+    include_leaf_glue: bool,
+) -> Result<(MockProvider, RecursorOptions), NetError> {
     let query_name = Name::from_ascii("host.hickory-dns.testing.")?;
     let dup_query_name = Name::from_ascii("host.hickory-dns-dup.testing.")?;
 
@@ -904,6 +910,16 @@ fn test_fixture() -> Result<(MockProvider, RecursorOptions), NetError> {
     let dup_leaf_zone = Name::from_ascii("hickory-dns-dup.testing.")?;
     let dup_leaf_ns = Name::from_ascii("ns.hickory-dns-dup.testing.")?;
 
+    let leaf_address = if include_leaf_glue {
+        MockRecord::a(TLD_IP, &leaf_ns, LEAF_IP)
+            .with_query_name(&leaf_zone)
+            .with_query_type(RecordType::NS)
+            .with_section(MockResponseSection::Additional)
+    } else {
+        // Force append_ips_from_lookup to obtain the address from the parent.
+        MockRecord::a(TLD_IP, &leaf_ns, LEAF_IP)
+    };
+
     let responses = vec![
         MockRecord::ns(ROOT_IP, &tld_zone, &tld_ns),
         MockRecord::a(ROOT_IP, &tld_ns, TLD_IP)
@@ -911,10 +927,7 @@ fn test_fixture() -> Result<(MockProvider, RecursorOptions), NetError> {
             .with_query_type(RecordType::NS)
             .with_section(MockResponseSection::Additional),
         MockRecord::ns(TLD_IP, &leaf_zone, &leaf_ns),
-        MockRecord::a(TLD_IP, &leaf_ns, LEAF_IP)
-            .with_query_name(&leaf_zone)
-            .with_query_type(RecordType::NS)
-            .with_section(MockResponseSection::Additional),
+        leaf_address,
         MockRecord::ns(TLD_IP, &dup_leaf_zone, &dup_leaf_ns),
         MockRecord::a(TLD_IP, &dup_leaf_ns, LEAF_IP)
             .with_query_name(&dup_leaf_zone)
@@ -1642,41 +1655,29 @@ mod policy_wiring {
     }
 
     #[tokio::test]
-    async fn from_config_keeps_existing_dns_behavior_with_or_without_policy() {
-        // Startup validation does not yet enforce the connection policy.
-        #[cfg(feature = "__tls")]
-        let json = policy_json();
-        for policy in [
-            None,
-            #[cfg(feature = "__tls")]
-            Some(json.as_str()),
-        ] {
-            let (recursor, provider) =
-                configured_recursor(policy, DnssecPolicyConfig::SecurityUnaware);
-            assert_eq!(
-                lookup_handle(&recursor)
-                    .authoritative_server_policy(LEAF_IP)
-                    .is_some(),
-                policy.is_some()
-            );
-            let query = Query::new(
-                Name::from_ascii("host.hickory-dns.testing.").unwrap(),
-                RecordType::A,
-            );
-            let response = recursor
-                .resolve(query, std::time::Instant::now(), false)
-                .await
-                .unwrap();
-            assert_eq!(response.response_code, ResponseCode::NoError);
-            assert!(
-                response
-                    .answers
-                    .iter()
-                    .any(|r| r.data.ip_addr() == Some(LEAF_IP))
-            );
-            assert!(provider.count_new_connection_calls(LEAF_IP, Protocol::Udp) > 0);
-            assert!(provider.count_new_connection_calls(LEAF_IP, Protocol::Tcp) > 0);
-        }
+    async fn from_config_without_policy_keeps_existing_dns_behavior() {
+        let (recursor, provider) = configured_recursor(None, DnssecPolicyConfig::SecurityUnaware);
+        assert_eq!(
+            lookup_handle(&recursor).authoritative_server_policy(LEAF_IP),
+            None
+        );
+        let query = Query::new(
+            Name::from_ascii("host.hickory-dns.testing.").unwrap(),
+            RecordType::A,
+        );
+        let response = recursor
+            .resolve(query, std::time::Instant::now(), false)
+            .await
+            .unwrap();
+        assert_eq!(response.response_code, ResponseCode::NoError);
+        assert!(
+            response
+                .answers
+                .iter()
+                .any(|r| r.data.ip_addr() == Some(LEAF_IP))
+        );
+        assert!(provider.count_new_connection_calls(LEAF_IP, Protocol::Udp) > 0);
+        assert!(provider.count_new_connection_calls(LEAF_IP, Protocol::Tcp) > 0);
     }
 
     #[test]
@@ -1749,6 +1750,236 @@ mod policy_wiring {
                 lookup_handle(&recursor).authoritative_server_policy(LEAF_IP),
                 None
             );
+        }
+    }
+
+    #[cfg(feature = "__tls")]
+    mod selection {
+        use std::{
+            net::IpAddr,
+            sync::{Arc, Mutex},
+            time::Instant,
+        };
+
+        use super::super::{TEST_TRUST_ANCHOR, TLD_IP, test_fixture_with_glue};
+        use super::*;
+        use crate::{
+            ConnectionProvider, PoolContext,
+            config::{
+                ConnectionConfig, OpportunisticEncryption, OpportunisticEncryptionConfig,
+                ProtocolConfig,
+            },
+            net::NetError,
+        };
+
+        #[derive(Clone)]
+        struct SelectionProvider {
+            inner: MockProvider,
+            calls: Arc<Mutex<Vec<SelectedConnection>>>,
+            fail_tls_for: Option<IpAddr>,
+        }
+
+        struct SelectedConnection {
+            ip: IpAddr,
+            config: ConnectionConfig,
+            uses_endpoint_tls: bool,
+        }
+
+        // Records resolver decisions. The mock TCP stream models a successful
+        // TLS connection without performing a handshake; these are selection
+        // tests, not evidence of live certificate authentication.
+        impl ConnectionProvider for SelectionProvider {
+            type Conn = <MockProvider as ConnectionProvider>::Conn;
+            type FutureConn = <MockProvider as ConnectionProvider>::FutureConn;
+            type RuntimeProvider = MockProvider;
+
+            fn new_connection(
+                &self,
+                ip: IpAddr,
+                config: &ConnectionConfig,
+                cx: &PoolContext,
+            ) -> Result<Self::FutureConn, NetError> {
+                self.calls.lock().unwrap().push(SelectedConnection {
+                    ip,
+                    config: config.clone(),
+                    uses_endpoint_tls: !std::ptr::eq(cx.tls_config_for_server(ip), &cx.tls),
+                });
+                let mut modeled = config.clone();
+                if matches!(config.protocol, ProtocolConfig::Tls { .. }) {
+                    if self.fail_tls_for == Some(ip) {
+                        return Err(NetError::from("simulated TLS connection failure"));
+                    }
+                    modeled.protocol = ProtocolConfig::Tcp;
+                }
+                self.inner.new_connection(ip, &modeled, cx)
+            }
+
+            fn runtime_provider(&self) -> &Self::RuntimeProvider {
+                &self.inner
+            }
+        }
+
+        fn server_name(ip: IpAddr) -> &'static str {
+            match ip {
+                ROOT_IP => "root.testing",
+                TLD_IP => "testing.testing",
+                LEAF_IP => "ns.hickory-dns.testing",
+                _ => panic!("unexpected fixture address"),
+            }
+        }
+
+        fn configured(
+            protected: &[IpAddr],
+            opportunistic: bool,
+            include_glue: bool,
+            fail_tls_for: Option<IpAddr>,
+        ) -> (Recursor<SelectionProvider>, SelectionProvider) {
+            let servers = protected
+                .iter()
+                .map(|ip| {
+                    serde_json::json!({
+                        "name": format!("{}.", server_name(*ip).to_ascii_uppercase()),
+                        "address": ip.to_string(),
+                        "protocol": "dot",
+                        "trust_anchor": TEST_TRUST_ANCHOR,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let json = serde_json::json!({"servers": servers}).to_string();
+            let files = ConfigFiles::new(Some(&json));
+            let (inner, mut options) = test_fixture_with_glue(include_glue).unwrap();
+            if opportunistic {
+                options.opportunistic_encryption = OpportunisticEncryption::Enabled {
+                    // Keep background probes out of this decision test; listed
+                    // endpoints must still use DoT without needing a probe.
+                    config: OpportunisticEncryptionConfig {
+                        max_concurrent_probes: 0,
+                        ..OpportunisticEncryptionConfig::default()
+                    },
+                };
+            }
+            let provider = SelectionProvider {
+                inner,
+                calls: Arc::new(Mutex::new(vec![])),
+                fail_tls_for,
+            };
+            let config = RecursiveConfig {
+                roots: "root.hints".into(),
+                forced_encrypted_authoritatives: Some("servers.json".into()),
+                dnssec_policy: DnssecPolicyConfig::SecurityUnaware,
+                options,
+            };
+            let recursor = Recursor::from_config(config, Some(&files.0), provider.clone()).unwrap();
+            (recursor, provider)
+        }
+
+        async fn resolve(
+            recursor: &Recursor<SelectionProvider>,
+        ) -> Result<crate::proto::op::Message, crate::recursor::RecursorError> {
+            recursor
+                .resolve(
+                    Query::new(
+                        Name::from_ascii("host.hickory-dns.testing.").unwrap(),
+                        RecordType::A,
+                    ),
+                    Instant::now(),
+                    false,
+                )
+                .await
+        }
+
+        fn assert_selected(provider: &SelectionProvider, protected: &[IpAddr]) {
+            let calls = provider.calls.lock().unwrap();
+            for ip in [ROOT_IP, TLD_IP, LEAF_IP] {
+                let selected = calls
+                    .iter()
+                    .filter(|call| call.ip == ip)
+                    .collect::<Vec<_>>();
+                assert!(!selected.is_empty(), "no connection selected for {ip}");
+                if protected.contains(&ip) {
+                    for call in selected {
+                        assert_eq!(call.config.port, 853);
+                        assert_eq!(
+                            call.config.protocol,
+                            ProtocolConfig::Tls {
+                                server_name: Arc::from(server_name(ip)),
+                            }
+                        );
+                        assert!(call.uses_endpoint_tls);
+                    }
+                } else {
+                    // With no successful opportunistic probe, ordinary servers
+                    // retain UDP followed by TCP for the truncated mock reply.
+                    assert!(
+                        selected
+                            .iter()
+                            .any(|call| call.config.protocol == ProtocolConfig::Udp)
+                    );
+                    assert!(
+                        selected
+                            .iter()
+                            .any(|call| call.config.protocol == ProtocolConfig::Tcp)
+                    );
+                    for call in selected {
+                        assert_eq!(call.config.port, 53);
+                        assert!(!call.uses_endpoint_tls);
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn listed_root_and_referral_addresses_select_dot_only() {
+            for opportunistic in [false, true] {
+                for protected in [
+                    vec![ROOT_IP],
+                    vec![TLD_IP],
+                    vec![LEAF_IP],
+                    vec![ROOT_IP, TLD_IP, LEAF_IP],
+                ] {
+                    let (recursor, provider) = configured(&protected, opportunistic, true, None);
+                    let response = resolve(&recursor).await.unwrap();
+                    assert_eq!(response.response_code, ResponseCode::NoError);
+                    assert!(
+                        response
+                            .answers
+                            .iter()
+                            .any(|r| r.data.ip_addr() == Some(LEAF_IP))
+                    );
+                    assert_selected(&provider, &protected);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn resolved_nameserver_addresses_select_dot_only() {
+            for opportunistic in [false, true] {
+                let (recursor, provider) = configured(&[LEAF_IP], opportunistic, false, None);
+                let response = resolve(&recursor).await.unwrap();
+                assert_eq!(response.response_code, ResponseCode::NoError);
+                assert!(
+                    response
+                        .answers
+                        .iter()
+                        .any(|r| r.data.ip_addr() == Some(LEAF_IP))
+                );
+                assert!(provider.inner.queries(&TLD_IP).contains(&Query::new(
+                    Name::from_ascii("ns.hickory-dns.testing.").unwrap(),
+                    RecordType::A,
+                )));
+                assert_selected(&provider, &[LEAF_IP]);
+            }
+        }
+
+        #[tokio::test]
+        async fn failed_dot_does_not_select_plaintext_for_the_listed_address() {
+            for opportunistic in [false, true] {
+                let (recursor, provider) =
+                    configured(&[LEAF_IP], opportunistic, true, Some(LEAF_IP));
+                assert!(resolve(&recursor).await.is_err());
+                assert_selected(&provider, &[LEAF_IP]);
+                assert!(provider.inner.queries(&LEAF_IP).is_empty());
+            }
         }
     }
 }

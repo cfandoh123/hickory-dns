@@ -528,6 +528,8 @@ impl<P: ConnectionProvider> ResolverBuilder<P> {
                 Some(config) => config,
                 None => TlsConfig::new()?.config,
             },
+            #[cfg(feature = "__tls")]
+            server_tls_configs: Default::default(),
             opportunistic_probe_budget: AtomicU8::new(
                 opportunistic_encryption
                     .max_concurrent_probes()

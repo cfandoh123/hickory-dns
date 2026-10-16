@@ -457,6 +457,9 @@ pub struct PoolContext {
     /// TLS configuration
     #[cfg(feature = "__tls")]
     pub tls: rustls::ClientConfig,
+    /// Immutable endpoint TLS settings, distinct from the shared/opportunistic settings.
+    #[cfg(feature = "__tls")]
+    pub(crate) server_tls_configs: HashMap<IpAddr, rustls::ClientConfig>,
     /// Opportunistic probe budget
     pub opportunistic_probe_budget: AtomicU8,
     /// Opportunistic encryption configuration
@@ -476,10 +479,29 @@ impl PoolContext {
             options,
             #[cfg(feature = "__tls")]
             tls: tls.config,
+            #[cfg(feature = "__tls")]
+            server_tls_configs: HashMap::new(),
             opportunistic_probe_budget: AtomicU8::default(),
             opportunistic_encryption: OpportunisticEncryption::default(),
             transport_state: AsyncMutex::new(NameServerTransportState::default()),
         }
+    }
+
+    /// Use separate certificate verification settings for a configured endpoint.
+    #[cfg(all(feature = "recursor", feature = "serde", feature = "__tls"))]
+    pub(crate) fn with_server_tls_config(
+        mut self,
+        ip: IpAddr,
+        config: rustls::ClientConfig,
+    ) -> Self {
+        self.server_tls_configs.insert(ip, config);
+        self
+    }
+
+    /// Return endpoint-specific settings when present, otherwise the shared defaults.
+    #[cfg(feature = "__tls")]
+    pub(crate) fn tls_config_for_server(&self, ip: IpAddr) -> &rustls::ClientConfig {
+        self.server_tls_configs.get(&ip).unwrap_or(&self.tls)
     }
 
     /// Set the opportunistic probe budget
