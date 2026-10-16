@@ -91,6 +91,9 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         >,
     ) -> Result<Self, RecursorError> {
         assert!(!roots.is_empty(), "roots must not be empty");
+        if options.connect_timeout_ms == Some(0) {
+            return Err("connect_timeout_ms must be greater than zero".into());
+        }
         let servers = roots
             .iter()
             .copied()
@@ -107,6 +110,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             .collect::<Vec<_>>();
 
         let RecursorOptions {
+            connect_timeout_ms,
             ns_cache_size,
             response_cache_size,
             recursion_limit,
@@ -135,6 +139,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 avoid_local_udp_ports.clone(),
                 case_randomization,
                 edns_payload_len,
+                connect_timeout_ms,
             ),
             tls,
         )
@@ -1116,8 +1121,9 @@ fn recursor_opts(
     avoid_local_udp_ports: Arc<HashSet<u16>>,
     case_randomization: bool,
     edns_payload_len: u16,
+    connect_timeout_ms: Option<u64>,
 ) -> ResolverOpts {
-    ResolverOpts {
+    let mut options = ResolverOpts {
         ndots: 0,
         edns0: true,
         #[cfg(feature = "__dnssec")]
@@ -1129,7 +1135,11 @@ fn recursor_opts(
         case_randomization,
         edns_payload_len,
         ..ResolverOpts::default()
+    };
+    if let Some(milliseconds) = connect_timeout_ms {
+        options.connect_timeout = Duration::from_millis(milliseconds);
     }
+    options
 }
 
 fn name_server_config(
@@ -1176,6 +1186,24 @@ mod tests {
         net::runtime::TokioRuntimeProvider,
         recursor::{DnssecPolicy, Recursor, RecursorMode, RecursorOptions},
     };
+
+    #[test]
+    fn zero_connection_timeout_is_rejected_at_startup() {
+        let options = RecursorOptions {
+            connect_timeout_ms: Some(0),
+            ..RecursorOptions::default()
+        };
+        match Recursor::new(
+            &[IpAddr::from([192, 0, 2, 1])],
+            DnssecPolicy::default(),
+            None,
+            options,
+            TokioRuntimeProvider::default(),
+        ) {
+            Err(error) => assert!(error.to_string().contains("connect_timeout_ms")),
+            Ok(_) => panic!("zero connection timeout was accepted"),
+        }
+    }
 
     #[test]
     fn test_nameserver_filter() {

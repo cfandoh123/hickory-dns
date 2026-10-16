@@ -1057,6 +1057,11 @@ impl ForcedEncryptedAuthoritativePolicy {
 #[derive(Clone, Eq, PartialEq, Debug)]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct RecursorOptions {
+    /// Optional connection-establishment budget in milliseconds. Must be nonzero.
+    /// Leave enough of the requesting client's DNS deadline for secure failover.
+    /// When absent, preserve the resolver's existing connection timeout.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub connect_timeout_ms: Option<u64>,
     /// Maximum nameserver cache size
     #[cfg_attr(feature = "serde", serde(default = "default_ns_cache_size"))]
     pub ns_cache_size: usize,
@@ -1133,6 +1138,7 @@ pub struct RecursorOptions {
 impl Default for RecursorOptions {
     fn default() -> Self {
         Self {
+            connect_timeout_ms: None,
             ns_cache_size: 1_024,
             response_cache_size: 1_048_576,
             recursion_limit: 24,

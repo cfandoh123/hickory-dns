@@ -57,6 +57,89 @@ const KEY: &str = include_str!("../../../../../tests/test-data/authenticated-dot
 const IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const EXPECTED_NAME: &str = "ns.auth-dot.test";
 
+#[tokio::test]
+async fn configured_timeout_bounds_a_real_stalled_tls_handshake() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let target = listener.local_addr().unwrap();
+    let stalled = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        // Read the client's first handshake byte, then never send ServerHello.
+        stream.read_u8().await.unwrap();
+        futures_util::future::pending::<()>().await;
+    });
+    let provider = ObservedProvider {
+        runtime: RoutedRuntime {
+            inner: TokioRuntimeProvider::new(),
+            tls: target,
+            plain: target,
+        },
+        calls: Arc::new(Mutex::new(vec![])),
+        errors: Arc::new(Mutex::new(vec![])),
+    };
+    let config: ForcedEncryptedAuthoritativeConfig =
+        serde_json::from_value(serde_json::json!({"servers":[{
+            "name": EXPECTED_NAME, "address": IP.to_string(), "protocol":"dot", "trust_anchor":CA
+        }]}))
+        .unwrap();
+    let policy = ForcedEncryptedAuthoritativePolicy::try_from(config).unwrap();
+    let recursor = Recursor::new_with_policy(
+        &[IP],
+        DnssecPolicy::SecurityUnaware,
+        None,
+        RecursorOptions {
+            connect_timeout_ms: Some(50),
+            deny_server: vec![],
+            ..Default::default()
+        },
+        provider.clone(),
+        Some(Arc::new(policy)),
+    )
+    .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        recursor.resolve(
+            Query::new(
+                Name::from_ascii("host.auth-dot.test.").unwrap(),
+                RecordType::A,
+            ),
+            Instant::now(),
+            false,
+        ),
+    )
+    .await;
+    stalled.abort();
+    let error = result
+        .expect("configured connection budget was ignored")
+        .err()
+        .expect("stalled TLS succeeded");
+    assert!(error.is_security_failure());
+    assert!(provider.errors.lock().unwrap().iter().any(|error| matches!(error,
+        NetError::RequiredTransportFailure { source, .. } if matches!(source.as_ref(), NetError::Timeout))));
+    assert!(
+        provider
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|config| config.port == 853
+                && matches!(config.protocol, ProtocolConfig::Tls { .. }))
+    );
+}
+
+#[cfg(feature = "toml")]
+#[test]
+fn connection_timeout_is_an_optional_millisecond_setting() {
+    use crate::recursor::RecursiveConfig;
+    let defaults: RecursiveConfig = toml::from_str("roots = 'root.hints'").unwrap();
+    assert_eq!(defaults.options.connect_timeout_ms, None);
+    let config: RecursiveConfig =
+        toml::from_str("roots = 'root.hints'\nconnect_timeout_ms = 500").unwrap();
+    assert_eq!(config.options.connect_timeout_ms, Some(500));
+    assert!(
+        toml::from_str::<RecursiveConfig>("roots = 'root.hints'\nconnect_timeout_ms = -1").is_err()
+    );
+}
+
 #[derive(Clone)]
 struct RoutedRuntime {
     inner: TokioRuntimeProvider,
