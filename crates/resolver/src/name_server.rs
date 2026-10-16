@@ -281,6 +281,8 @@ impl<P: ConnectionProvider> NameServer<P> {
             connections.retain(|conn| {
                 let usable = matches!(conn.meta.status(), Status::Init | Status::Established);
                 #[cfg(feature = "__tls")]
+                // A live connection is insufficient: its verifier must be
+                // exactly the one required by this immutable endpoint policy.
                 let usable = usable && conn.tls_identity.as_ref() == required_identity;
                 usable
             });
@@ -359,6 +361,7 @@ impl<P: ConnectionProvider> NameServer<P> {
             .map(|conn| conn.protocol.to_protocol())
     }
 
+    /// Whether this endpoint has both required TLS settings and a matching TLS protocol.
     pub(crate) fn can_authenticate(&self, cx: &PoolContext) -> bool {
         #[cfg(feature = "__tls")]
         {

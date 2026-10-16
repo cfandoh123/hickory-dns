@@ -81,6 +81,8 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
     ) -> Result<Self::FutureConn, NetError> {
         let remote_addr = SocketAddr::new(ip, config.port);
         #[cfg(feature = "__tls")]
+        // Defend the connection boundary as well as pool selection: callers
+        // must not reach a configured endpoint using a weaker protocol or name.
         if let Some(required) = cx.server_tls_configs.get(&ip) {
             if config.port != 853
                 || !matches!(&config.protocol,
@@ -133,6 +135,8 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
                 let server_name = server_name.to_owned();
                 let expected_name = server_name.to_str().into_owned();
                 let required = cx.server_tls_configs.contains_key(&ip);
+                // Include the TLS handshake in the connection budget, leaving
+                // the query deadline time to try another approved endpoint.
                 let connect_budget = cx.options.connect_timeout.min(cx.options.timeout);
                 let connecting = tls_exchange(
                     remote_addr,
@@ -259,9 +263,11 @@ pub(crate) struct TlsConfigIdentity(Arc<rustls::ClientConfig>);
 
 #[cfg(feature = "__tls")]
 impl TlsConfigIdentity {
+    /// Allocate a stable identity whose lifetime also keeps the TLS settings alive.
     pub(crate) fn new(config: rustls::ClientConfig) -> Self {
         Self(Arc::new(config))
     }
+    /// Borrow the immutable settings identified by this value.
     pub(crate) fn config(&self) -> &rustls::ClientConfig {
         &self.0
     }
@@ -290,9 +296,12 @@ impl std::fmt::Debug for TlsConfigIdentity {
     }
 }
 
+/// One configured endpoint's expected DNS identity and independent verifier settings.
 #[cfg(feature = "__tls")]
 pub(crate) struct ServerTlsConfig {
+    /// Canonical identity used for certificate checks and SNI.
     pub(crate) server_name: Arc<str>,
+    /// Shared trust settings used to distinguish reusable authenticated sessions.
     pub(crate) identity: TlsConfigIdentity,
 }
 

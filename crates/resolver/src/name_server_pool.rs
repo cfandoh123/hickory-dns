@@ -115,11 +115,13 @@ impl<P: ConnectionProvider> NameServerPool<P> {
     }
 
     /// Select only configured authenticated endpoints, including on retries.
+    /// The flag belongs to the pool so retry/ordering paths cannot silently weaken it.
     pub(crate) fn with_required_authentication(mut self) -> Self {
         self.require_authentication = true;
         self
     }
 
+    /// Whether every selection and retry must stay within authenticated endpoints.
     pub(crate) fn requires_authentication(&self) -> bool {
         self.require_authentication
     }

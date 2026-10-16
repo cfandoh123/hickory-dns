@@ -617,7 +617,12 @@ pub struct RecursiveConfig {
     pub options: RecursorOptions,
 }
 
-/// JSON policy for authoritative servers with support for encrypted transport
+/// JSON policy for authoritative servers with support for encrypted transport.
+///
+/// Conversion to the runtime policy validates endpoint identities and trust
+/// material once at startup. `zones` supplies direct local authorization; setting
+/// `authenticated_referrals` instead requires a trusted channel at every supported
+/// referral/dependency hop and forbids those direct bindings.
 #[cfg(feature = "serde")]
 #[derive(Clone, Deserialize, Eq, PartialEq, Debug)]
 #[serde(deny_unknown_fields)]
@@ -726,6 +731,9 @@ pub enum ForcedEncryptedAuthoritativeProtocol {
 impl TryFrom<ForcedEncryptedAuthoritativeConfig> for ForcedEncryptedAuthoritativePolicy {
     type Error = ForcedEncryptedAuthoritativePolicyError;
 
+    /// Validate and index endpoint requirements before any DNS traffic is sent.
+    /// Equivalent entries are deduplicated, conflicting identities or trust stores
+    /// are rejected, and zone bindings are resolved to approved explicit addresses.
     fn try_from(config: ForcedEncryptedAuthoritativeConfig) -> Result<Self, Self::Error> {
         let mut servers: HashMap<IpAddr, ForcedEncryptedAuthoritativeServerPolicy> =
             HashMap::with_capacity(config.servers.len());
@@ -868,6 +876,9 @@ impl TryFrom<ForcedEncryptedAuthoritativeConfig> for ForcedEncryptedAuthoritativ
 
 #[cfg(all(feature = "serde", feature = "__tls"))]
 impl ForcedEncryptedAuthoritativeServerConfig {
+    /// Parse every PEM certificate block; reject malformed or unrelated material.
+    /// This validates local trust-store input, not a peer certificate chain. Rustls
+    /// performs peer signature, name and validity checks when the connection opens.
     fn parse_trust_anchor(
         &self,
     ) -> Result<Vec<TrustAnchor<'static>>, ForcedEncryptedAuthoritativePolicyError> {
@@ -1014,6 +1025,7 @@ pub(crate) struct ForcedEncryptedAuthoritativeServerPolicy {
 
 #[cfg(feature = "serde")]
 impl ForcedEncryptedAuthoritativeServerPolicy {
+    /// Compare protocol and trusted certificate sets independently of PEM formatting.
     fn same_trust_policy(&self, other: &Self) -> bool {
         if self.protocol != other.protocol {
             return false;
@@ -1035,6 +1047,9 @@ impl ForcedEncryptedAuthoritativeServerPolicy {
     }
 }
 
+/// Validated, immutable policy shared by recursive lookups.
+/// Endpoint requirements are indexed by IP; optional zone bindings contain only
+/// addresses already validated in that endpoint map.
 #[cfg(feature = "serde")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ForcedEncryptedAuthoritativePolicy {
@@ -1045,6 +1060,7 @@ pub(crate) struct ForcedEncryptedAuthoritativePolicy {
 
 #[cfg(feature = "serde")]
 impl ForcedEncryptedAuthoritativePolicy {
+    /// Return the most specific binding covering the canonical DNS name.
     pub(crate) fn zone_for(&self, name: &Name) -> Option<(&Name, &[IpAddr])> {
         let mut name = name.to_lowercase();
         name.set_fqdn(true);
@@ -1055,6 +1071,7 @@ impl ForcedEncryptedAuthoritativePolicy {
             .map(|(zone, servers)| (zone, servers.as_slice()))
     }
 
+    /// Return the validated identity and trust settings for an explicit endpoint address.
     pub(crate) fn server_for(
         &self,
         ip: IpAddr,
@@ -1062,6 +1079,7 @@ impl ForcedEncryptedAuthoritativePolicy {
         self.servers.get(&ip)
     }
 
+    /// Return a configured requirement, never an opportunistically discovered preference.
     pub(crate) fn protocol_for(&self, ip: IpAddr) -> Option<ForcedEncryptedAuthoritativeProtocol> {
         self.server_for(ip).map(|server| server.protocol)
     }

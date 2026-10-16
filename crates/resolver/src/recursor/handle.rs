@@ -49,6 +49,9 @@ use crate::{
     },
 };
 
+/// Cache identity for an endpoint and the immutable trust settings used to reach it.
+/// An address alone would allow an ordinary or differently authenticated session
+/// to be reused for a protected lookup.
 #[derive(Clone, Eq, PartialEq, Hash)]
 struct ConnectionCacheKey {
     config: NameServerConfig,
@@ -194,6 +197,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         let roots =
             NameServerPool::from_config(servers, pool_context.clone(), conn_provider.clone());
         #[cfg(feature = "serde")]
+        // Start the trust requirement at the root; adding it only to child
+        // pools would leave the first referral open to substitution.
         let roots = if forced_encrypted_authoritative_policy
             .as_ref()
             .is_some_and(|policy| policy.authenticated_referrals)
@@ -254,6 +259,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             .and_then(|policy| policy.server_for(ip))
     }
 
+    /// Choose required DoT for a configured endpoint before considering opportunistic defaults.
     fn name_server_config(&self, ip: IpAddr) -> NameServerConfig {
         name_server_config(
             ip,
@@ -263,6 +269,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         )
     }
 
+    /// Reuse endpoint state only when connection parameters and TLS trust identity match.
     fn cached_name_server(&self, config: &NameServerConfig) -> Arc<NameServer<P>> {
         let key = ConnectionCacheKey {
             config: config.clone(),
@@ -288,12 +295,14 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
     }
 
     #[cfg(feature = "serde")]
+    /// Find the longest trusted local binding covering a name, if binding mode is in use.
     fn configured_zone(&self, name: &Name) -> Option<(&Name, &[IpAddr])> {
         self.forced_encrypted_authoritative_policy
             .as_ref()
             .and_then(|policy| policy.zone_for(name))
     }
 
+    /// Whether all referral and supported dependency hops require authenticated transport.
     fn authenticated_referrals(&self) -> bool {
         #[cfg(feature = "serde")]
         return self
@@ -304,8 +313,9 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         false
     }
 
-    // A trusted parent authorizes the NS identity; the curated configuration
-    // authenticates that identity at this address. An IP match alone is not enough.
+    /// Authorize a referred NS name/address pair before creating its connection settings.
+    /// A trusted parent supplies the NS identity; the curated endpoint policy supplies
+    /// its permitted address and trust anchor. An IP match alone is not sufficient.
     fn referral_server_config(
         &self,
         name: &Name,
@@ -328,6 +338,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         Ok(self.name_server_config(ip))
     }
 
+    /// Keep protected answers and referrals separate from ordinary cached responses.
+    /// DS records belong to the parent zone, so binding-mode selection uses that parent.
     fn response_cache_for_query(&self, query: &Query) -> &ResponseCache {
         #[cfg(feature = "serde")]
         {
@@ -345,6 +357,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
     }
 
     #[cfg(feature = "serde")]
+    /// Build a required-authentication pool from a trusted local zone binding.
+    /// These addresses bypass referral discovery; authenticated-referral mode forbids bindings.
     fn configured_pool(&self, query: &Name) -> Result<Option<NameServerPool<P>>, RecursorError> {
         let Some((zone, addresses)) = self.configured_zone(query) else {
             return Ok(None);
@@ -669,6 +683,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         Some(Ok(response))
     }
 
+    /// Query one zone pool, filter its response and cache it under the appropriate trust level.
+    /// A required pool may return referrals only for NS discovery in referral mode.
     async fn lookup(
         &self,
         query: Query,
@@ -783,6 +799,9 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
     }
 
     /// Identify the correct NameServerPool to use to answer queries for a given name.
+    /// Local bindings select a pool directly. Otherwise, walk referrals from the
+    /// roots; referral mode authenticates each pool and checks NS identities before
+    /// adding it to the nameserver cache.
     #[async_recursion]
     pub(crate) async fn ns_pool_for_name(
         &self,
@@ -1036,6 +1055,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         ttl
     }
 
+    /// Resolve missing nameserver addresses while preserving the original transport requirement.
+    /// Return the minimum address TTL and updated recursion depth for the resulting pool.
     async fn append_ips_from_lookup<'a, I: Iterator<Item = &'a NS>>(
         &self,
         zone: &Name,
@@ -1077,6 +1098,10 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                         Err(error) if error.is_no_records_found() || error.is_nx_domain() => {
                             continue;
                         }
+                        // TODO: Try other authenticated NS candidates before
+                        // aborting discovery. The availability benchmark found
+                        // that this early return prevents glueless failover when
+                        // one dependency fails but an approved backup is reachable.
                         Err(error) => return Err(error),
                     };
                     // resolve() follows and authenticates aliases. Only the
@@ -1289,6 +1314,7 @@ fn recursor_opts(
     options
 }
 
+/// Construct endpoint protocols without allowing a required policy to become a preference.
 fn name_server_config(
     ip: IpAddr,
     opportunistic_encryption: &OpportunisticEncryption,

@@ -1,5 +1,9 @@
 //! Policy, retry, and cache tests. TLS verification itself is covered by the
 //! separate real-socket authenticated_dot tests; this provider models decisions.
+//!
+//! The provider records protocols, TLS identities and DNS questions independently.
+//! Injected failures exercise retry/cache policy without treating a mock TLS result
+//! as evidence of cryptographic certificate validation.
 use super::{ConnectionCacheKey, RecursorDnsHandle};
 use crate::{
     ConnectionProvider, PoolContext, TlsConfig,
@@ -69,6 +73,7 @@ struct State {
     reply: Arc<Reply>,
 }
 
+/// Deterministic policy-test provider; real certificate checks live in authenticated_dot.
 #[derive(Clone)]
 struct Provider {
     runtime: TokioRuntimeProvider,

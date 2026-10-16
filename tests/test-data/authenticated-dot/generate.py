@@ -15,10 +15,12 @@ BASE = Path(__file__).resolve().parent
 
 
 def date(year):
+    """Return a fixed UTC boundary so fixture validity is reproducible."""
     return datetime(year, 1, 1, tzinfo=timezone.utc)
 
 
 def authority(name):
+    """Create a test CA whose signing key is discarded after fixture generation."""
     key = ec.generate_private_key(ec.SECP256R1())
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
     cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject)
@@ -31,6 +33,7 @@ def authority(name):
 
 
 def save_cert(name, cert):
+    """Write a public certificate next to the explicitly public test server key."""
     (BASE / name).write_bytes(cert.public_bytes(serialization.Encoding.PEM))
 
 

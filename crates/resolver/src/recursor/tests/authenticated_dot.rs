@@ -1,5 +1,8 @@
 //! Real loopback TLS handshakes through the production connection provider.
 //! Only the destination port is remapped, so tests need no privileged port 853.
+//! The production connection provider still performs certificate verification.
+//! Independent plaintext/TLS controls distinguish a genuine authentication rejection
+//! from an unreachable or incorrectly configured test server.
 
 use std::{
     future::Future,
@@ -140,6 +143,7 @@ fn connection_timeout_is_an_optional_millisecond_setting() {
     );
 }
 
+/// Route logical DNS endpoints to unprivileged loopback test listeners.
 #[derive(Clone)]
 struct RoutedRuntime {
     inner: TokioRuntimeProvider,
