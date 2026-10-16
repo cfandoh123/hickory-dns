@@ -94,6 +94,17 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         if options.connect_timeout_ms == Some(0) {
             return Err("connect_timeout_ms must be greater than zero".into());
         }
+        #[cfg(feature = "serde")]
+        if let Some(policy) = &forced_encrypted_authoritative_policy {
+            if policy.authenticated_referrals
+                && roots.iter().any(|ip| policy.server_for(*ip).is_none())
+            {
+                return Err(RecursorError::SecurityPolicy {
+                    name: Name::root(),
+                    reason: "authenticated referrals require a configured identity for every root address",
+                });
+            }
+        }
         let servers = roots
             .iter()
             .copied()
@@ -182,6 +193,15 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         let pool_context = Arc::new(pool_context);
         let roots =
             NameServerPool::from_config(servers, pool_context.clone(), conn_provider.clone());
+        #[cfg(feature = "serde")]
+        let roots = if forced_encrypted_authoritative_policy
+            .as_ref()
+            .is_some_and(|policy| policy.authenticated_referrals)
+        {
+            roots.with_required_authentication()
+        } else {
+            roots
+        };
 
         let name_server_cache = Arc::new(Mutex::new(LruCache::new(ns_cache_size)));
         let response_cache = ResponseCache::new(response_cache_size, cache_policy.clone());
@@ -274,6 +294,40 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             .and_then(|policy| policy.zone_for(name))
     }
 
+    fn authenticated_referrals(&self) -> bool {
+        #[cfg(feature = "serde")]
+        return self
+            .forced_encrypted_authoritative_policy
+            .as_ref()
+            .is_some_and(|policy| policy.authenticated_referrals);
+        #[cfg(not(feature = "serde"))]
+        false
+    }
+
+    // A trusted parent authorizes the NS identity; the curated configuration
+    // authenticates that identity at this address. An IP match alone is not enough.
+    fn referral_server_config(
+        &self,
+        name: &Name,
+        ip: IpAddr,
+    ) -> Result<NameServerConfig, RecursorError> {
+        #[cfg(feature = "serde")]
+        if self.authenticated_referrals() {
+            let expected = name.to_ascii().trim_end_matches('.').to_ascii_lowercase();
+            if !self
+                .authoritative_server_policy(ip)
+                .is_some_and(|server| server.tls_name == expected)
+            {
+                return Err(RecursorError::SecurityPolicy {
+                    name: name.clone(),
+                    reason: "referral nameserver name and address do not match a configured authenticated endpoint",
+                });
+            }
+        }
+        let _ = name;
+        Ok(self.name_server_config(ip))
+    }
+
     fn response_cache_for_query(&self, query: &Query) -> &ResponseCache {
         #[cfg(feature = "serde")]
         {
@@ -282,7 +336,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             } else {
                 query.name.clone()
             };
-            if self.configured_zone(&zone).is_some() {
+            if self.authenticated_referrals() || self.configured_zone(&zone).is_some() {
                 return &self.authenticated_response_cache;
             }
         }
@@ -506,7 +560,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         let mut cname_chain = vec![];
         let mut revalidated_names = HashSet::new();
         #[cfg(feature = "serde")]
-        let requires_authentication = self.configured_zone(&query.name).is_some();
+        let requires_authentication =
+            self.authenticated_referrals() || self.configured_zone(&query.name).is_some();
 
         for rec in response.all_sections() {
             let CNAME(name) = &rec.data else {
@@ -514,7 +569,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             };
 
             #[cfg(feature = "serde")]
-            let protected_target = self.configured_zone(&name.0).is_some();
+            let protected_target =
+                self.authenticated_referrals() || self.configured_zone(&name.0).is_some();
             #[cfg(not(feature = "serde"))]
             let protected_target = false;
             #[cfg(feature = "serde")]
@@ -583,12 +639,12 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             }));
         }
 
-        if !cname_chain.is_empty() {
-            response
-                .answers
-                .retain(|record| !revalidated_names.contains(&record.name));
-            response.answers.extend(cname_chain);
-        }
+        // Also remove inline data when revalidation returns NODATA: an empty
+        // authenticated answer must not leave the original inline address alive.
+        response
+            .answers
+            .retain(|record| !revalidated_names.contains(&record.name));
+        response.answers.extend(cname_chain);
 
         Ok(response)
     }
@@ -668,7 +724,10 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             }
         };
 
-        if required && !response.authoritative {
+        if required
+            && !response.authoritative
+            && !(self.authenticated_referrals() && query.query_type == RecordType::NS)
+        {
             return Err(RecursorError::SecurityPolicy {
                 name: zone,
                 reason: "bound server returned a non-authoritative referral; configure an explicit child-zone binding",
@@ -763,7 +822,10 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             let query = Query::new(zone.clone(), RecordType::NS);
 
             // Query for nameserver records via the pool for the parent zone.
-            let lookup_res = match self.response_cache.get(&query, request_time) {
+            let lookup_res = match self
+                .response_cache_for_query(&query)
+                .get(&query, request_time)
+            {
                 Some(Ok(response)) => {
                     debug!(?response, "cached data");
                     Ok(response)
@@ -829,6 +891,9 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                     continue;
                 };
 
+                if self.authenticated_referrals() && zns.name != zone {
+                    continue;
+                }
                 if !is_subzone(&zone.base_name(), &zns.name) {
                     debug!(
                         name = ?zns.name,
@@ -843,9 +908,10 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 }
 
                 for record_type in [RecordType::A, RecordType::AAAA] {
+                    let address_query = Query::new(ns_data.0.clone(), record_type);
                     if let Some(Ok(response)) = self
-                        .response_cache
-                        .get(&Query::new(ns_data.0.clone(), record_type), request_time)
+                        .response_cache_for_query(&address_query)
+                        .get(&address_query, request_time)
                     {
                         let ttl = self.add_glue_to_map(&mut glue_ips, response.all_sections());
                         if ttl < ns_pool_ttl {
@@ -856,8 +922,9 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
                 match glue_ips.get(&ns_data.0) {
                     Some(glue) if !glue.is_empty() => {
-                        config_group
-                            .extend(glue.iter().copied().map(|ip| self.name_server_config(ip)));
+                        for ip in glue.iter().copied() {
+                            config_group.push(self.referral_server_config(&ns_data.0, ip)?);
+                        }
                     }
                     _ => {
                         debug!(name_server = ?ns_data, "glue not found for name server");
@@ -901,6 +968,16 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             nameserver_pool = NameServerPool::from_nameservers(servers, self.pool_context.clone())
                 .with_ttl(ns_pool_ttl)
                 .with_zone(zone.clone());
+
+            if self.authenticated_referrals() {
+                if config_group.is_empty() {
+                    return Err(RecursorError::SecurityPolicy {
+                        name: zone.clone(),
+                        reason: "referral has no usable authenticated nameserver addresses",
+                    });
+                }
+                nameserver_pool = nameserver_pool.with_required_authentication();
+            }
 
             // store in cache for future usage
             debug!(?zone, "found nameservers for {zone}");
@@ -968,6 +1045,76 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         nameservers: I,
         config: &mut Vec<NameServerConfig>,
     ) -> Result<(u32, u8), RecursorError> {
+        // Dependency lookups in this mode must use the same authenticated
+        // recursion and CNAME handling as the original query, never an ordinary
+        // cache or pool. In-bailiwick glueless cycles fail closed if the parent
+        // cannot supply an address; recursion limits bound external cycles.
+        if self.authenticated_referrals() {
+            let mut ttl = u32::MAX;
+            for ns in nameservers {
+                for kind in [RecordType::A, RecordType::AAAA] {
+                    let query = Query::new(ns.0.clone(), kind);
+                    let result = if is_subzone(zone, &ns.0) {
+                        self.lookup(
+                            query,
+                            zone.base_name(),
+                            nameserver_pool.clone(),
+                            request_time,
+                        )
+                        .await
+                    } else {
+                        self.resolve(
+                            query,
+                            request_time,
+                            true,
+                            depth + 1,
+                            Arc::new(AtomicU8::new(0)),
+                        )
+                        .await
+                    };
+                    let message = match result {
+                        Ok(message) => message,
+                        Err(error) if error.is_no_records_found() || error.is_nx_domain() => {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    // resolve() follows and authenticates aliases. Only the
+                    // terminal address RRset, not arbitrary extra answers, counts.
+                    let mut terminal = ns.0.clone();
+                    for _ in 0..MAX_CNAME_LOOKUPS {
+                        match message.answers.iter().find_map(|record| {
+                            if record.name != terminal {
+                                return None;
+                            }
+                            if let CNAME(target) = &record.data {
+                                Some(target.0.clone())
+                            } else {
+                                None
+                            }
+                        }) {
+                            Some(target) => terminal = target,
+                            None => break,
+                        }
+                    }
+                    for answer in message
+                        .answers
+                        .iter()
+                        .filter(|answer| answer.name == terminal && answer.record_type() == kind)
+                    {
+                        let Some(ip) = answer.data.ip_addr() else {
+                            continue;
+                        };
+                        if self.name_server_filter.denied(ip) {
+                            continue;
+                        }
+                        config.push(self.referral_server_config(&ns.0, ip)?);
+                        ttl = ttl.min(answer.ttl);
+                    }
+                }
+            }
+            return Ok((ttl, depth));
+        }
         let mut pool_queries = vec![];
 
         for ns in nameservers {

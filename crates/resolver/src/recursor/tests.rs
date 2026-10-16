@@ -1236,6 +1236,7 @@ enabled = {}
         let address = server.address.unwrap();
         let policy =
             ForcedEncryptedAuthoritativePolicy::try_from(ForcedEncryptedAuthoritativeConfig {
+                authenticated_referrals: false,
                 servers: vec![server.clone()],
                 zones: vec![],
             })
@@ -1253,6 +1254,7 @@ enabled = {}
     #[test]
     fn forced_encrypted_authoritative_config_converts_to_policy() {
         let config = ForcedEncryptedAuthoritativeConfig {
+            authenticated_referrals: false,
             zones: vec![],
             servers: vec![ForcedEncryptedAuthoritativeServerConfig {
                 name: Name::from_ascii("a.root-servers.net.").unwrap(),
@@ -1315,6 +1317,7 @@ enabled = {}
     #[test]
     fn forced_encrypted_authoritative_config_rejects_invalid_policy_entries() {
         let missing_address = ForcedEncryptedAuthoritativeConfig {
+            authenticated_referrals: false,
             zones: vec![],
             servers: vec![ForcedEncryptedAuthoritativeServerConfig {
                 name: Name::from_ascii("a.root-servers.net.").unwrap(),
@@ -1360,6 +1363,7 @@ mod policy_validation {
 
     fn convert(servers: Vec<Server>) -> Result<ForcedEncryptedAuthoritativePolicy, PolicyError> {
         ForcedEncryptedAuthoritativeConfig {
+            authenticated_referrals: false,
             servers,
             zones: vec![],
         }

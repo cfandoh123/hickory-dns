@@ -622,6 +622,10 @@ pub struct RecursiveConfig {
 #[derive(Clone, Deserialize, Eq, PartialEq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct ForcedEncryptedAuthoritativeConfig {
+    /// Follow referrals from configured roots, requiring authenticated DoT for
+    /// every hop and dependency. Incompatible with direct local zone bindings.
+    #[serde(default)]
+    pub authenticated_referrals: bool,
     /// Authoritative servers covered by this policy
     pub servers: Vec<ForcedEncryptedAuthoritativeServerConfig>,
     /// Trusted zone-to-server bindings. Each binding protects the zone and its
@@ -800,6 +804,12 @@ impl TryFrom<ForcedEncryptedAuthoritativeConfig> for ForcedEncryptedAuthoritativ
             servers.insert(server.address, server);
         }
 
+        if config.authenticated_referrals && (!config.zones.is_empty() || servers.is_empty()) {
+            return Err(ForcedEncryptedAuthoritativePolicyError::InvalidZone {
+                name: Name::root(),
+                reason: "authenticated_referrals requires server entries and no local zone bindings",
+            });
+        }
         let mut zones = HashMap::new();
         for binding in config.zones {
             let mut name = binding.name.to_lowercase();
@@ -848,7 +858,11 @@ impl TryFrom<ForcedEncryptedAuthoritativeConfig> for ForcedEncryptedAuthoritativ
                 zones.insert(name, addresses);
             }
         }
-        Ok(Self { servers, zones })
+        Ok(Self {
+            servers,
+            zones,
+            authenticated_referrals: config.authenticated_referrals,
+        })
     }
 }
 
@@ -1024,6 +1038,7 @@ impl ForcedEncryptedAuthoritativeServerPolicy {
 #[cfg(feature = "serde")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ForcedEncryptedAuthoritativePolicy {
+    authenticated_referrals: bool,
     servers: HashMap<IpAddr, ForcedEncryptedAuthoritativeServerPolicy>,
     zones: HashMap<Name, Vec<IpAddr>>,
 }

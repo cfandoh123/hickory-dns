@@ -19,7 +19,7 @@ use crate::{
         op::{DnsRequest, DnsRequestOptions, DnsResponse, Message, Query, ResponseCode},
         rr::{
             Name, RData, Record, RecordType,
-            rdata::{CNAME, NS},
+            rdata::{CNAME, NS, SOA},
         },
     },
     recursor::{
@@ -274,6 +274,358 @@ fn good(message: &Message) {
             .iter()
             .any(|record| record.data.ip_addr() == Some("198.51.100.66".parse().unwrap()))
     );
+}
+
+fn referral_policy() -> serde_json::Value {
+    serde_json::json!({"authenticated_referrals":true,"servers":[
+        {"name":"ns.root.test","address":ROOT.to_string(),"protocol":"dot","trust_anchor":CA},
+        {"name":PRIMARY_NAME,"address":PRIMARY.to_string(),"protocol":"dot","trust_anchor":CA},
+        {"name":SECONDARY_NAME,"address":SECONDARY.to_string(),"protocol":"dot","trust_anchor":CA}
+    ]})
+}
+
+fn referral_resolver(provider: &Provider, opportunistic: bool) -> Recursor<Provider> {
+    let config =
+        serde_json::from_value::<ForcedEncryptedAuthoritativeConfig>(referral_policy()).unwrap();
+    let policy = ForcedEncryptedAuthoritativePolicy::try_from(config).unwrap();
+    let mut options = RecursorOptions {
+        deny_server: vec![],
+        ..Default::default()
+    };
+    if opportunistic {
+        options.opportunistic_encryption = OpportunisticEncryption::Enabled {
+            config: OpportunisticEncryptionConfig {
+                max_concurrent_probes: 0,
+                ..Default::default()
+            },
+        };
+    }
+    Recursor::new_with_policy(
+        &[ROOT],
+        DnssecPolicy::SecurityUnaware,
+        None,
+        options,
+        provider.clone(),
+        Some(Arc::new(policy)),
+    )
+    .unwrap()
+}
+
+fn delegation(request: Message, zone: &str, ns: &str, ip: Option<IpAddr>) -> Message {
+    let mut message = request.into_response();
+    message.authoritative = false;
+    message.add_authority(Record::from_rdata(
+        name(zone),
+        30,
+        RData::NS(NS(name(&format!("{}.", ns.trim_end_matches('.'))))),
+    ));
+    if let Some(ip) = ip {
+        message.add_additional(Record::from_rdata(
+            name(&format!("{}.", ns.trim_end_matches('.'))),
+            30,
+            RData::from(ip),
+        ));
+    }
+    message
+}
+
+fn hierarchy(ip: IpAddr, request: Message, glueless: bool) -> Message {
+    let q = request.queries[0].clone();
+    if ip == ROOT && q.name == name("test.") {
+        return delegation(request, "test.", PRIMARY_NAME, Some(PRIMARY));
+    }
+    if ip == PRIMARY
+        && ["bound.test.", "other.test."]
+            .iter()
+            .any(|zone| q.name == name(zone))
+    {
+        return delegation(
+            request,
+            &q.name.to_ascii(),
+            SECONDARY_NAME,
+            if glueless { None } else { Some(SECONDARY) },
+        );
+    }
+    if ip == PRIMARY && q.name == name("ns.secondary.test.") && q.query_type == RecordType::A {
+        let mut m = request.into_response();
+        m.authoritative = true;
+        m.add_answer(Record::from_rdata(q.name, 30, RData::from(SECONDARY)));
+        return m;
+    }
+    // NS probes for names that are not cuts yield authoritative NODATA.
+    response(ip, request)
+}
+
+#[test]
+fn referral_mode_rejects_local_bindings_empty_servers_and_unknown_roots() {
+    let mut value = referral_policy();
+    value["zones"] = binding(&[PRIMARY_NAME]);
+    assert!(
+        ForcedEncryptedAuthoritativePolicy::try_from(
+            serde_json::from_value::<ForcedEncryptedAuthoritativeConfig>(value).unwrap()
+        )
+        .is_err()
+    );
+    let empty = serde_json::from_value::<ForcedEncryptedAuthoritativeConfig>(
+        serde_json::json!({"authenticated_referrals":true,"servers":[]}),
+    )
+    .unwrap();
+    assert!(ForcedEncryptedAuthoritativePolicy::try_from(empty).is_err());
+    let policy = ForcedEncryptedAuthoritativePolicy::try_from(
+        serde_json::from_value::<ForcedEncryptedAuthoritativeConfig>(referral_policy()).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        Recursor::new_with_policy(
+            &[PLAIN],
+            DnssecPolicy::SecurityUnaware,
+            None,
+            RecursorOptions::default(),
+            Provider::new(response),
+            Some(Arc::new(policy))
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn authenticated_referrals_follow_root_parent_child_with_and_without_glue() {
+    for glueless in [false, true] {
+        for opportunistic in [false, true] {
+            let provider = Provider::new(move |ip, request| hierarchy(ip, request, glueless));
+            let recursor = referral_resolver(&provider, opportunistic);
+            good(&lookup(&recursor, "probe.bound.test.").await.unwrap());
+            for ip in [ROOT, PRIMARY, SECONDARY] {
+                assert!(provider.called(ip));
+            }
+            provider.assert_tls_only();
+            if glueless {
+                assert!(
+                    provider
+                        .state
+                        .queries
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(ip, q)| *ip == PRIMARY
+                            && q.name == name("ns.secondary.test.")
+                            && q.query_type == RecordType::A)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn authenticated_referrals_reject_wrong_names_and_unknown_addresses() {
+    for (ns, ip) in [("attacker.test", SECONDARY), (SECONDARY_NAME, PLAIN)] {
+        let provider = Provider::new(move |ip_, request| {
+            if ip_ == PRIMARY && request.queries[0].name == name("bound.test.") {
+                delegation(request, "bound.test.", ns, Some(ip))
+            } else {
+                hierarchy(ip_, request, false)
+            }
+        });
+        assert!(
+            lookup(&referral_resolver(&provider, false), "probe.bound.test.")
+                .await
+                .unwrap_err()
+                .is_security_failure()
+        );
+        assert!(!provider.called(SECONDARY));
+        assert!(!provider.called(PLAIN));
+        provider.assert_tls_only();
+    }
+}
+
+#[tokio::test]
+async fn authenticated_referrals_do_not_reuse_ordinary_cached_referrals_or_answers() {
+    let provider = Provider::new(|ip, request| hierarchy(ip, request, false));
+    let recursor = referral_resolver(&provider, false);
+    let handle = handle(&recursor);
+    let mut request = Message::query();
+    request.add_query(Query::new(name("test."), RecordType::NS));
+    handle.response_cache.insert(
+        Query::new(name("test."), RecordType::NS),
+        Ok(delegation(request, "test.", "attacker.test", Some(PLAIN))),
+        Instant::now(),
+    );
+    let mut request = Message::query();
+    request.add_query(query("probe.bound.test."));
+    handle.response_cache.insert(
+        query("probe.bound.test."),
+        Ok(response(PLAIN, request)),
+        Instant::now(),
+    );
+    good(&lookup(&recursor, "probe.bound.test.").await.unwrap());
+    assert!(!provider.called(PLAIN));
+    provider.assert_tls_only();
+}
+
+#[tokio::test]
+async fn authenticated_referrals_fail_closed_at_every_hop() {
+    for failed in [ROOT, PRIMARY, SECONDARY] {
+        let provider = Provider::new(|ip, request| hierarchy(ip, request, false));
+        provider.fail(failed, Failure::Certificate);
+        assert!(
+            lookup(&referral_resolver(&provider, true), "probe.bound.test.")
+                .await
+                .unwrap_err()
+                .is_security_failure()
+        );
+        provider.assert_tls_only();
+    }
+}
+
+#[tokio::test]
+async fn authenticated_referrals_resolve_cname_dependencies_through_the_hierarchy() {
+    let provider = Provider::new(|ip, request| {
+        let q = request.queries[0].clone();
+        if ip == SECONDARY && q.name == name("alias.bound.test.") && q.query_type == RecordType::A {
+            let mut m = request.into_response();
+            m.authoritative = true;
+            m.add_answer(Record::from_rdata(
+                q.name,
+                30,
+                RData::CNAME(CNAME(name("probe.other.test."))),
+            ));
+            m.add_answer(Record::from_rdata(
+                name("probe.other.test."),
+                30,
+                RData::from(Ipv4Addr::new(198, 51, 100, 66)),
+            ));
+            return m;
+        }
+        hierarchy(ip, request, false)
+    });
+    good(
+        &lookup(&referral_resolver(&provider, false), "alias.bound.test.")
+            .await
+            .unwrap(),
+    );
+    assert!(
+        provider
+            .state
+            .queries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(ip, q)| *ip == PRIMARY && q.name == name("other.test."))
+    );
+    provider.assert_tls_only();
+}
+
+#[tokio::test]
+async fn authenticated_referrals_discard_inline_address_when_cname_target_has_no_data() {
+    let provider = Provider::new(|ip, request| {
+        let q = request.queries[0].clone();
+        if ip == SECONDARY && q.name == name("nodata.bound.test.") && q.query_type == RecordType::A
+        {
+            let mut message = request.into_response();
+            message.authoritative = true;
+            message.add_authority(Record::from_rdata(
+                name("bound.test."),
+                30,
+                RData::SOA(SOA::new(
+                    name("ns.secondary.test."),
+                    name("hostmaster.bound.test."),
+                    1,
+                    60,
+                    30,
+                    3600,
+                    30,
+                )),
+            ));
+            return message;
+        }
+        if ip == SECONDARY && q.name == name("alias.bound.test.") && q.query_type == RecordType::A {
+            let mut message = request.into_response();
+            message.authoritative = true;
+            message.add_answer(Record::from_rdata(
+                q.name,
+                30,
+                RData::CNAME(CNAME(name("nodata.bound.test."))),
+            ));
+            message.add_answer(Record::from_rdata(
+                name("nodata.bound.test."),
+                30,
+                RData::from(Ipv4Addr::new(198, 51, 100, 66)),
+            ));
+            return message;
+        }
+        hierarchy(ip, request, false)
+    });
+    let result = lookup(&referral_resolver(&provider, false), "alias.bound.test.").await;
+    match result {
+        Ok(message) => assert!(!message.answers.iter().any(|r| r.data.ip_addr().is_some())),
+        Err(error) => assert!(error.is_no_records_found()),
+    }
+    assert!(
+        provider
+            .state
+            .queries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(ip, q)| *ip == SECONDARY
+                && q.name == name("nodata.bound.test.")
+                && q.query_type == RecordType::A)
+    );
+    provider.assert_tls_only();
+}
+
+#[tokio::test]
+async fn authenticated_referrals_keep_ds_queries_on_the_authenticated_parent() {
+    let provider = Provider::new(|ip, request| hierarchy(ip, request, false));
+    let recursor = referral_resolver(&provider, false);
+    let _ = recursor
+        .resolve(
+            Query::new(name("bound.test."), RecordType::DS),
+            Instant::now(),
+            true,
+        )
+        .await;
+    assert!(
+        provider
+            .state
+            .queries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(ip, q)| *ip == PRIMARY
+                && q.name == name("bound.test.")
+                && q.query_type == RecordType::DS)
+    );
+    assert!(!provider.called(SECONDARY));
+    provider.assert_tls_only();
+}
+
+#[tokio::test]
+async fn authenticated_referrals_ignore_unrelated_ns_and_address_records() {
+    let provider = Provider::new(|ip, request| {
+        if ip == PRIMARY && request.queries[0].name == name("bound.test.") {
+            let mut message = delegation(request, "bound.test.", SECONDARY_NAME, Some(SECONDARY));
+            message.add_authority(Record::from_rdata(
+                name("unrelated.test."),
+                30,
+                RData::NS(NS(name("attacker.test."))),
+            ));
+            message.add_additional(Record::from_rdata(
+                name("attacker.test."),
+                30,
+                RData::from(PLAIN),
+            ));
+            return message;
+        }
+        hierarchy(ip, request, false)
+    });
+    good(
+        &lookup(&referral_resolver(&provider, false), "probe.bound.test.")
+            .await
+            .unwrap(),
+    );
+    assert!(!provider.called(PLAIN));
+    provider.assert_tls_only();
 }
 
 #[test]
