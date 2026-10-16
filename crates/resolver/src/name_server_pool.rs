@@ -61,6 +61,7 @@ pub struct NameServerPool<P: ConnectionProvider> {
     active_requests: Arc<Mutex<HashMap<Arc<CacheKey>, SharedLookup>>>,
     ttl: Option<TtlInstant>,
     zone: Option<Name>,
+    require_authentication: bool,
 }
 
 impl<P: ConnectionProvider> NameServerPool<P> {
@@ -97,6 +98,7 @@ impl<P: ConnectionProvider> NameServerPool<P> {
             active_requests: Arc::new(Mutex::new(HashMap::new())),
             ttl: None,
             zone: None,
+            require_authentication: false,
         }
     }
 
@@ -110,6 +112,16 @@ impl<P: ConnectionProvider> NameServerPool<P> {
     pub fn with_zone(mut self, zone: Name) -> Self {
         self.zone = Some(zone);
         self
+    }
+
+    /// Select only configured authenticated endpoints, including on retries.
+    pub(crate) fn with_required_authentication(mut self) -> Self {
+        self.require_authentication = true;
+        self
+    }
+
+    pub(crate) fn requires_authentication(&self) -> bool {
+        self.require_authentication
     }
 
     /// Check if the TTL on the NameServerPool (if set) has expired
@@ -149,6 +161,7 @@ impl<P: ConnectionProvider> DnsHandle for NameServerPool<P> {
 
     fn send(&self, request: DnsRequest) -> Self::Response {
         let state = self.state.clone();
+        let require_authentication = self.require_authentication;
         let acs = self.state.cx.answer_address_filter.clone();
         let active_requests = self.active_requests.clone();
 
@@ -170,7 +183,7 @@ impl<P: ConnectionProvider> DnsHandle for NameServerPool<P> {
                     debug!(%query, "creating new shared lookup");
 
                     let lookup = async move {
-                        match state.try_send(request).await {
+                        match state.try_send(request, require_authentication).await {
                             Ok(response) => Some(Ok(response)),
                             Err(e) => Some(Err(e)),
                         }
@@ -250,8 +263,21 @@ struct PoolState<P: ConnectionProvider> {
 }
 
 impl<P: ConnectionProvider> PoolState<P> {
-    async fn try_send(&self, request: DnsRequest) -> Result<DnsResponse, NetError> {
+    async fn try_send(
+        &self,
+        request: DnsRequest,
+        require_authentication: bool,
+    ) -> Result<DnsResponse, NetError> {
         let mut servers = self.servers.clone();
+        if require_authentication {
+            // Filter before ordering, racing, retries, or busy-server recovery.
+            servers.retain(|server| server.can_authenticate(&self.cx));
+            if servers.is_empty() {
+                return Err(NetError::SecurityPolicy(
+                    "no approved authenticated endpoint in pool".into(),
+                ));
+            }
+        }
         match self.cx.options.server_ordering_strategy {
             // select the highest priority connection
             //   reorder the connections based on current view...
@@ -355,7 +381,23 @@ impl<P: ConnectionProvider> PoolState<P> {
             // error) — used to avoid double-penalizing them.
             let mut completed = SmallVec::<[IpAddr; 2]>::new();
 
-            while let Some((server, result)) = requests.next().await {
+            while !requests.is_empty() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let next = futures_util::future::select(
+                    Box::pin(requests.next()),
+                    Box::pin(<<P as ConnectionProvider>::RuntimeProvider as RuntimeProvider>::Timer::delay_for(remaining)),
+                ).await;
+                let (server, result) = match next {
+                    futures_util::future::Either::Left((Some(result), _)) => result,
+                    futures_util::future::Either::Left((None, _)) => break,
+                    futures_util::future::Either::Right(_) => {
+                        return Err(if err.is_security_failure() {
+                            err
+                        } else {
+                            NetError::Timeout
+                        });
+                    }
+                };
                 completed.push(server.ip());
                 let e = match result {
                     Ok(response) if response.truncation => {
@@ -390,7 +432,14 @@ impl<P: ConnectionProvider> PoolState<P> {
                     // If the server is busy, try it again later if necessary.
                     NetError::Busy => busy.push(server),
                     // If the connection failed or timed out, try another one.
-                    NetError::Io(_) | NetError::NoConnections | NetError::Timeout => {}
+                    NetError::Io(_)
+                    | NetError::NoConnections
+                    | NetError::Timeout
+                    | NetError::RequiredTransportFailure { .. } => {}
+                    NetError::Dns(DnsError::NoRecordsFound(NoRecords {
+                        response_code: ResponseCode::ServFail | ResponseCode::Refused,
+                        ..
+                    })) if require_authentication => {}
                     // If we got an `NXDomain` response from a server whose negative responses we
                     // don't trust, we should try another server.
                     NetError::Dns(DnsError::NoRecordsFound(NoRecords {
@@ -408,6 +457,12 @@ impl<P: ConnectionProvider> PoolState<P> {
 
 /// Compare two errors to see if one contains a server response.
 fn most_specific(previous: NetError, current: NetError) -> NetError {
+    if previous.is_security_failure() {
+        return previous;
+    }
+    if current.is_security_failure() {
+        return current;
+    }
     match (&previous, &current) {
         (
             NetError::Dns(DnsError::NoRecordsFound { .. }),
@@ -459,7 +514,7 @@ pub struct PoolContext {
     pub tls: rustls::ClientConfig,
     /// Immutable endpoint TLS settings, distinct from the shared/opportunistic settings.
     #[cfg(feature = "__tls")]
-    pub(crate) server_tls_configs: HashMap<IpAddr, rustls::ClientConfig>,
+    pub(crate) server_tls_configs: HashMap<IpAddr, crate::connection_provider::ServerTlsConfig>,
     /// Opportunistic probe budget
     pub opportunistic_probe_budget: AtomicU8,
     /// Opportunistic encryption configuration
@@ -492,16 +547,26 @@ impl PoolContext {
     pub(crate) fn with_server_tls_config(
         mut self,
         ip: IpAddr,
+        server_name: Arc<str>,
         config: rustls::ClientConfig,
     ) -> Self {
-        self.server_tls_configs.insert(ip, config);
+        self.server_tls_configs.insert(
+            ip,
+            crate::connection_provider::ServerTlsConfig {
+                server_name,
+                identity: crate::connection_provider::TlsConfigIdentity::new(config),
+            },
+        );
         self
     }
 
     /// Return endpoint-specific settings when present, otherwise the shared defaults.
     #[cfg(feature = "__tls")]
     pub(crate) fn tls_config_for_server(&self, ip: IpAddr) -> &rustls::ClientConfig {
-        self.server_tls_configs.get(&ip).unwrap_or(&self.tls)
+        self.server_tls_configs
+            .get(&ip)
+            .map(|server| server.identity.config())
+            .unwrap_or(&self.tls)
     }
 
     /// Set the opportunistic probe budget

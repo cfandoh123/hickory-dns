@@ -1237,6 +1237,7 @@ enabled = {}
         let policy =
             ForcedEncryptedAuthoritativePolicy::try_from(ForcedEncryptedAuthoritativeConfig {
                 servers: vec![server.clone()],
+                zones: vec![],
             })
             .unwrap();
 
@@ -1252,6 +1253,7 @@ enabled = {}
     #[test]
     fn forced_encrypted_authoritative_config_converts_to_policy() {
         let config = ForcedEncryptedAuthoritativeConfig {
+            zones: vec![],
             servers: vec![ForcedEncryptedAuthoritativeServerConfig {
                 name: Name::from_ascii("a.root-servers.net.").unwrap(),
                 address: Some("198.41.0.4".parse().unwrap()),
@@ -1313,6 +1315,7 @@ enabled = {}
     #[test]
     fn forced_encrypted_authoritative_config_rejects_invalid_policy_entries() {
         let missing_address = ForcedEncryptedAuthoritativeConfig {
+            zones: vec![],
             servers: vec![ForcedEncryptedAuthoritativeServerConfig {
                 name: Name::from_ascii("a.root-servers.net.").unwrap(),
                 address: None,
@@ -1356,7 +1359,11 @@ mod policy_validation {
     }
 
     fn convert(servers: Vec<Server>) -> Result<ForcedEncryptedAuthoritativePolicy, PolicyError> {
-        ForcedEncryptedAuthoritativeConfig { servers }.try_into()
+        ForcedEncryptedAuthoritativeConfig {
+            servers,
+            zones: vec![],
+        }
+        .try_into()
     }
 
     #[test]
@@ -1814,7 +1821,12 @@ mod policy_wiring {
                     }
                     modeled.protocol = ProtocolConfig::Tcp;
                 }
-                self.inner.new_connection(ip, &modeled, cx)
+                // The wire model is plaintext TCP, so it must use a separate
+                // non-policy context. Production correctly rejects TCP with the
+                // real required-DoT context; these tests only record selection.
+                let modeled_cx =
+                    PoolContext::new(cx.options.clone(), crate::TlsConfig::new().unwrap());
+                self.inner.new_connection(ip, &modeled, &modeled_cx)
             }
 
             fn runtime_provider(&self) -> &Self::RuntimeProvider {

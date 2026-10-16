@@ -29,6 +29,14 @@ use crate::{
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RecursorError {
+    /// Trusted local authentication requirements could not be satisfied.
+    #[error("security policy failure for {name}: {reason}")]
+    SecurityPolicy {
+        /// Query or protected zone affected by the failure.
+        name: Name,
+        /// Explanation of the unmet requirement.
+        reason: &'static str,
+    },
     /// Maximum record limit was exceeded
     #[error("maximum record limit for {record_type} exceeded: {count} records")]
     MaxRecordLimitExceeded {
@@ -76,6 +84,15 @@ pub enum RecursorError {
 }
 
 impl RecursorError {
+    /// Whether weakening the transport or trying a parent is forbidden.
+    pub fn is_security_failure(&self) -> bool {
+        match self {
+            Self::SecurityPolicy { .. } => true,
+            Self::Net(error) => error.is_security_failure(),
+            _ => false,
+        }
+    }
+
     /// Test if the recursion depth has been exceeded, and return an error if it has.
     pub fn recursion_exceeded(limit: u8, depth: u8, name: &Name) -> Result<(), Self> {
         if depth < limit {
@@ -150,6 +167,10 @@ impl From<RecursorError> for NetError {
     fn from(e: RecursorError) -> Self {
         match e {
             RecursorError::Negative(fwd) => DnsError::NoRecordsFound(fwd.into()).into(),
+            RecursorError::Net(error) => error,
+            error @ RecursorError::SecurityPolicy { .. } => {
+                Self::SecurityPolicy(error.to_string().into())
+            }
             _ => Self::from(e.to_string()),
         }
     }
@@ -177,6 +198,10 @@ impl Clone for RecursorError {
     fn clone(&self) -> Self {
         use self::RecursorError::*;
         match self {
+            SecurityPolicy { name, reason } => SecurityPolicy {
+                name: name.clone(),
+                reason,
+            },
             MaxRecordLimitExceeded { count, record_type } => MaxRecordLimitExceeded {
                 count: *count,
                 record_type: *record_type,

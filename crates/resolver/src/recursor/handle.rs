@@ -14,6 +14,10 @@ use lru_cache::LruCache;
 use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
+#[cfg(all(test, feature = "serde", feature = "__tls"))]
+#[path = "security_tests.rs"]
+mod security_tests;
+
 #[cfg(all(feature = "serde", feature = "__tls"))]
 use super::ForcedEncryptedAuthoritativeProtocol;
 use super::{
@@ -45,11 +49,20 @@ use crate::{
     },
 };
 
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct ConnectionCacheKey {
+    config: NameServerConfig,
+    #[cfg(feature = "__tls")]
+    tls_identity: Option<crate::connection_provider::TlsConfigIdentity>,
+}
+
 #[derive(Clone)]
 pub(crate) struct RecursorDnsHandle<P: ConnectionProvider> {
     roots: NameServerPool<P>,
     name_server_cache: Arc<Mutex<LruCache<Name, NameServerPool<P>>>>,
     response_cache: ResponseCache,
+    #[cfg(feature = "serde")]
+    authenticated_response_cache: ResponseCache,
     #[cfg(feature = "metrics")]
     pub(super) metrics: RecursorMetrics,
     recursion_limit: u8,
@@ -57,7 +70,7 @@ pub(crate) struct RecursorDnsHandle<P: ConnectionProvider> {
     name_server_filter: AccessControlSet,
     pool_context: Arc<PoolContext>,
     conn_provider: P,
-    connection_cache: Arc<Mutex<LruCache<IpAddr, Arc<NameServer<P>>>>>,
+    connection_cache: Arc<Mutex<LruCache<ConnectionCacheKey, Arc<NameServer<P>>>>>,
     request_options: DnsRequestOptions,
     ttl_config: TtlConfig,
     qname_minimization: QNameMinimization,
@@ -144,9 +157,6 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         #[cfg(all(feature = "serde", feature = "__tls"))]
         if let Some(policy) = &forced_encrypted_authoritative_policy {
             for server in policy.servers.values() {
-                // Build from the configured anchors alone. In particular, never
-                // clone the shared TLS config: opportunistic mode may have
-                // installed its certificate-verification bypass there.
                 let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
                     crate::net::tls::default_provider(),
                 ))
@@ -156,7 +166,11 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                     roots: server.trust_roots.clone(),
                 })
                 .with_no_client_auth();
-                pool_context = pool_context.with_server_tls_config(server.address, tls);
+                pool_context = pool_context.with_server_tls_config(
+                    server.address,
+                    Arc::from(server.tls_name.as_str()),
+                    tls,
+                );
             }
         }
 
@@ -180,6 +194,11 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             roots,
             name_server_cache,
             response_cache,
+            #[cfg(feature = "serde")]
+            authenticated_response_cache: ResponseCache::new(
+                response_cache_size,
+                cache_policy.clone(),
+            ),
             #[cfg(feature = "metrics")]
             metrics: RecursorMetrics::new(),
             recursion_limit,
@@ -210,7 +229,6 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             .and_then(|policy| policy.server_for(ip))
     }
 
-    /// Use the same endpoint selection for referral glue and resolved NS addresses.
     fn name_server_config(&self, ip: IpAddr) -> NameServerConfig {
         name_server_config(
             ip,
@@ -218,6 +236,79 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             #[cfg(all(feature = "serde", feature = "__tls"))]
             self.authoritative_server_policy(ip),
         )
+    }
+
+    fn cached_name_server(&self, config: &NameServerConfig) -> Arc<NameServer<P>> {
+        let key = ConnectionCacheKey {
+            config: config.clone(),
+            #[cfg(feature = "__tls")]
+            tls_identity: self
+                .pool_context
+                .server_tls_configs
+                .get(&config.ip)
+                .map(|server| server.identity.clone()),
+        };
+        let mut cache = self.connection_cache.lock();
+        if let Some(server) = cache.get_mut(&key) {
+            return server.clone();
+        }
+        let server = Arc::new(NameServer::new(
+            [],
+            config.clone(),
+            &self.pool_context.options,
+            self.conn_provider.clone(),
+        ));
+        cache.insert(key, server.clone());
+        server
+    }
+
+    #[cfg(feature = "serde")]
+    fn configured_zone(&self, name: &Name) -> Option<(&Name, &[IpAddr])> {
+        self.forced_encrypted_authoritative_policy
+            .as_ref()
+            .and_then(|policy| policy.zone_for(name))
+    }
+
+    fn response_cache_for_query(&self, query: &Query) -> &ResponseCache {
+        #[cfg(feature = "serde")]
+        {
+            let zone = if query.query_type == RecordType::DS {
+                query.name.base_name()
+            } else {
+                query.name.clone()
+            };
+            if self.configured_zone(&zone).is_some() {
+                return &self.authenticated_response_cache;
+            }
+        }
+        let _ = query;
+        &self.response_cache
+    }
+
+    #[cfg(feature = "serde")]
+    fn configured_pool(&self, query: &Name) -> Result<Option<NameServerPool<P>>, RecursorError> {
+        let Some((zone, addresses)) = self.configured_zone(query) else {
+            return Ok(None);
+        };
+        // Local bindings are an authenticated bootstrap: an untrusted referral
+        // cannot add, remove, or replace these eligible endpoints.
+        let servers = addresses
+            .iter()
+            .copied()
+            .filter(|ip| !self.name_server_filter.denied(*ip))
+            .map(|ip| self.cached_name_server(&self.name_server_config(ip)))
+            .collect::<Vec<_>>();
+        if servers.is_empty() {
+            return Err(RecursorError::SecurityPolicy {
+                name: zone.clone(),
+                reason: "no approved endpoint passes the server address filter",
+            });
+        }
+        Ok(Some(
+            NameServerPool::from_nameservers(servers, self.pool_context.clone())
+                .with_zone(zone.clone())
+                .with_required_authentication(),
+        ))
     }
 
     pub(crate) async fn resolve(
@@ -231,7 +322,20 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         #[cfg(feature = "metrics")]
         let _guard = self.metrics.new_inflight_query();
 
-        if let Some(result) = self.response_cache.get(&query, request_time) {
+        #[cfg(feature = "serde")]
+        if query.query_type == RecordType::DS
+            && self.configured_zone(&query.name).is_some()
+            && self.configured_zone(&query.name.base_name()).is_none()
+        {
+            return Err(RecursorError::SecurityPolicy {
+                name: query.name.clone(),
+                reason: "DS queries require an authenticated binding for the parent zone",
+            });
+        }
+        if let Some(result) = self
+            .response_cache_for_query(&query)
+            .get(&query, request_time)
+        {
             let response = result?;
             if response.authoritative {
                 #[cfg(feature = "metrics")]
@@ -307,6 +411,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             .await
         {
             Ok((depth, ns)) => (depth, ns),
+            Err(e) if e.is_security_failure() => return Err(e),
             // Handle the short circuit case for when we receive NXDOMAIN on a parent name, per RFC
             // 8020.
             Err(e) if e.is_nx_domain() => return Err(e),
@@ -394,15 +499,33 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         RecursorError::recursion_exceeded(self.recursion_limit, depth, &query.name)?;
 
         let mut cname_chain = vec![];
+        let mut revalidated_names = HashSet::new();
+        #[cfg(feature = "serde")]
+        let requires_authentication = self.configured_zone(&query.name).is_some();
 
         for rec in response.all_sections() {
             let CNAME(name) = &rec.data else {
                 continue;
             };
 
-            // Check if the response has data for the canonical name.
-            if response.answers.iter().any(|record| record.name == name.0) {
+            #[cfg(feature = "serde")]
+            let protected_target = self.configured_zone(&name.0).is_some();
+            #[cfg(not(feature = "serde"))]
+            let protected_target = false;
+            #[cfg(feature = "serde")]
+            if requires_authentication && !protected_target {
+                return Err(RecursorError::SecurityPolicy {
+                    name: name.0.clone(),
+                    reason: "protected CNAME target has no authenticated zone binding",
+                });
+            }
+            // Inline data from a different zone must not bypass its own local
+            // binding. Re-resolve protected targets, including cached CNAMEs.
+            if !protected_target && response.answers.iter().any(|record| record.name == name.0) {
                 continue;
+            }
+            if protected_target {
+                revalidated_names.insert(name.0.clone());
             }
 
             let cname_query = Query::new(name.0.clone(), query_type);
@@ -456,6 +579,9 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         }
 
         if !cname_chain.is_empty() {
+            response
+                .answers
+                .retain(|record| !revalidated_names.contains(&record.name));
             response.answers.extend(cname_chain);
         }
 
@@ -468,7 +594,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         query: &Query,
         now: Instant,
     ) -> Option<Result<Message, RecursorError>> {
-        let response = match self.response_cache.get(query, now) {
+        let response = match self.response_cache_for_query(query).get(query, now) {
             Some(Ok(response)) => response,
             Some(Err(e)) => return Some(Err(e.into())),
             None => return None,
@@ -489,6 +615,15 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         ns: NameServerPool<P>,
         now: Instant,
     ) -> Result<Message, RecursorError> {
+        let required = ns.requires_authentication();
+        #[cfg(feature = "serde")]
+        let cache = if required {
+            &self.authenticated_response_cache
+        } else {
+            &self.response_cache
+        };
+        #[cfg(not(feature = "serde"))]
+        let cache = &self.response_cache;
         let mut response = ns.lookup(query.clone(), self.request_options);
 
         #[cfg(feature = "metrics")]
@@ -500,7 +635,26 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             Some(Ok(r)) => r,
             Some(Err(error)) => {
                 warn!(?query, %error, "lookup error");
-                self.response_cache.insert(query, Err(error.clone()), now);
+                if required
+                    && !error.is_security_failure()
+                    && !matches!(
+                        &error,
+                        crate::net::NetError::Dns(crate::net::DnsError::NoRecordsFound(
+                            crate::net::NoRecords {
+                                response_code: crate::proto::op::ResponseCode::NoError
+                                    | crate::proto::op::ResponseCode::NXDomain,
+                                ns: None,
+                                ..
+                            }
+                        ))
+                    )
+                {
+                    return Err(crate::net::NetError::SecurityPolicy(
+                        format!("authenticated zone {zone}: {error}").into(),
+                    )
+                    .into());
+                }
+                cache.insert(query, Err(error.clone()), now);
                 return Err(RecursorError::from(error));
             }
             None => {
@@ -509,7 +663,22 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             }
         };
 
+        if required && !response.authoritative {
+            return Err(RecursorError::SecurityPolicy {
+                name: zone,
+                reason: "bound server returned a non-authoritative referral; configure an explicit child-zone binding",
+            });
+        }
+
         let answer_filter = |record: &Record| {
+            #[cfg(feature = "serde")]
+            if let Some((record_zone, _)) = self.configured_zone(&record.name) {
+                // Inline records cannot claim authority belonging to another
+                // binding, even for ANY/CNAME queries that do not chase aliases.
+                if !required || record_zone != &zone {
+                    return false;
+                }
+            }
             if !is_subzone(&zone, &record.name) {
                 debug!(
                     %record, %zone,
@@ -545,7 +714,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         }
 
         let message = response.into_message();
-        self.response_cache.insert(query, Ok(message.clone()), now);
+        cache.insert(query, Ok(message.clone()), now);
         Ok(message)
     }
 
@@ -557,6 +726,10 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         request_time: Instant,
         mut depth: u8,
     ) -> Result<(u8, NameServerPool<P>), RecursorError> {
+        #[cfg(feature = "serde")]
+        if let Some(pool) = self.configured_pool(&query_name)? {
+            return Ok((depth, pool));
+        }
         // Iterate through zones from TLD down to the query name (not including root)
         let num_labels = query_name.num_labels();
         trace!(num_labels, %query_name, "looking for zones");
@@ -599,6 +772,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
             let response = match lookup_res {
                 Ok(response) => response,
+                Err(e) if e.is_security_failure() => return Err(e),
                 // Short-circuit on NXDOMAIN, per RFC 8020.
                 // RFC 9156 also describes a relaxed mode where RFC 8020 is not enforced.
                 Err(e)
@@ -711,27 +885,10 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 }
             }
 
-            let servers = {
-                let mut cache = self.connection_cache.lock();
-                config_group
-                    .iter()
-                    .map(|server| {
-                        if let Some(ns) = cache.get_mut(&server.ip) {
-                            return ns.clone();
-                        }
-
-                        debug!(?server, "adding new name server to cache");
-                        let ns = Arc::new(NameServer::new(
-                            [],
-                            server.clone(),
-                            &self.pool_context.options,
-                            self.conn_provider.clone(),
-                        ));
-                        cache.insert(server.ip, ns.clone());
-                        ns
-                    })
-                    .collect()
-            };
+            let servers = config_group
+                .iter()
+                .map(|server| self.cached_name_server(server))
+                .collect();
 
             let ns_pool_ttl =
                 Duration::from_secs(ns_pool_ttl as u64).clamp(positive_min_ttl, positive_max_ttl);
@@ -825,6 +982,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                     // original queried domain doesn't exist, only that this nameserver
                     // is unreachable. Skip it and try others. If they all fail, the
                     // empty pool will result in SERVFAIL.
+                    Err(error) if error.is_security_failure() => return Err(error),
                     Err(error) => {
                         debug!(?record_name, ?error, "nameserver hostname lookup failure");
                         continue;
@@ -841,17 +999,18 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
         for (pool, query) in pool_queries.iter() {
             for rec_type in [RecordType::A, RecordType::AAAA] {
+                let required = pool.requires_authentication();
                 futures.push(Box::pin(
                     pool.lookup(Query::new(query.clone(), rec_type), self.request_options)
                         .into_future()
-                        .map(|(first, _rest)| first),
+                        .map(move |(first, _rest)| (required, first)),
                 ));
             }
         }
 
         let mut ttl = u32::MAX;
 
-        while let Some(next) = futures.next().await {
+        while let Some((required, next)) = futures.next().await {
             match next {
                 Some(Ok(response)) => {
                     debug!("append_ips_from_lookup: A or AAAA response: {response:?}");
@@ -873,6 +1032,15 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                         }).map(|ip| self.name_server_config(ip)));
                 }
                 Some(Err(e)) => {
+                    if e.is_security_failure() {
+                        return Err(e.into());
+                    }
+                    if required && !e.is_no_records_found() {
+                        return Err(crate::net::NetError::SecurityPolicy(
+                            format!("authenticated nameserver address lookup: {e}").into(),
+                        )
+                        .into());
+                    }
                     warn!("append_ips_from_lookup: resolution failed failed: {e}");
                 }
                 None => {
@@ -975,16 +1143,13 @@ fn name_server_config(
     if let Some(required) = required {
         return match required.protocol {
             ForcedEncryptedAuthoritativeProtocol::Dot => {
-                // This list intentionally has no UDP, plaintext TCP, or QUIC
-                // alternatives, even when opportunistic encryption is enabled.
                 NameServerConfig::tls(ip, Arc::from(required.tls_name.as_str()))
             }
             ForcedEncryptedAuthoritativeProtocol::Doq => {
-                unreachable!("required DoQ is rejected during policy validation")
+                unreachable!("required DoQ is rejected during startup validation")
             }
         };
     }
-
     match opportunistic_encryption {
         #[cfg(any(
             feature = "tls-aws-lc-rs",

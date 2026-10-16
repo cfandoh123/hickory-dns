@@ -370,6 +370,9 @@ fn assert_dot_only(provider: &ObservedProvider) {
 }
 
 fn certificate_error(error: &NetError) -> Option<&CertificateError> {
+    if let NetError::RequiredTransportFailure { source, .. } = error {
+        return certificate_error(source);
+    }
     let error = match error {
         NetError::RustlsError(error) => error,
         NetError::Io(error) => error.get_ref()?.downcast_ref::<rustls::Error>()?,

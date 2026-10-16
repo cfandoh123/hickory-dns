@@ -220,7 +220,10 @@ impl<P: ConnectionProvider> NameServer<P> {
                     // updating server_srtt ensures the server is deprioritized in pool
                     // ordering (decayed_srtt) so other servers get a chance to be tried.
                     match &error {
-                        NetError::Busy | NetError::Io(_) | NetError::Timeout => {
+                        NetError::Busy
+                        | NetError::Io(_)
+                        | NetError::Timeout
+                        | NetError::RequiredTransportFailure { .. } => {
                             meta.srtt.record_failure();
                             self.server_srtt.record_failure();
                         }
@@ -262,11 +265,25 @@ impl<P: ConnectionProvider> NameServer<P> {
         policy: ConnectionPolicy,
         cx: &Arc<PoolContext>,
     ) -> Result<ConnectedClient<P>, (NetError, Option<Protocol>)> {
+        #[cfg(feature = "__tls")]
+        let required_identity = cx
+            .server_tls_configs
+            .get(&self.config.ip)
+            .map(|server| &server.identity);
+        #[cfg(feature = "__tls")]
+        let policy = ConnectionPolicy {
+            require_tls: policy.require_tls || required_identity.is_some(),
+            ..policy
+        };
         // Check for an existing usable connection (short lock)
         {
             let mut connections = self.connections.lock().await;
-            connections
-                .retain(|conn| matches!(conn.meta.status(), Status::Init | Status::Established));
+            connections.retain(|conn| {
+                let usable = matches!(conn.meta.status(), Status::Init | Status::Established);
+                #[cfg(feature = "__tls")]
+                let usable = usable && conn.tls_identity.as_ref() == required_identity;
+                usable
+            });
             if let Some(conn) = policy.select_connection(
                 self.config.ip,
                 &*cx.transport_state().await,
@@ -320,6 +337,11 @@ impl<P: ConnectionProvider> NameServer<P> {
 
         // Store the new connection (with lock)
         let state = ConnectionState::new(handle.clone(), protocol);
+        #[cfg(feature = "__tls")]
+        let state = ConnectionState {
+            tls_identity: required_identity.cloned(),
+            ..state
+        };
         let meta = state.meta.clone();
         self.connections.lock().await.push(state);
         Ok(ConnectedClient {
@@ -335,6 +357,24 @@ impl<P: ConnectionProvider> NameServer<P> {
             .connections
             .iter()
             .map(|conn| conn.protocol.to_protocol())
+    }
+
+    pub(crate) fn can_authenticate(&self, cx: &PoolContext) -> bool {
+        #[cfg(feature = "__tls")]
+        {
+            let Some(required) = cx.server_tls_configs.get(&self.config.ip) else {
+                return false;
+            };
+            !self.config.connections.is_empty() && self.config.connections.iter().all(|config| {
+                config.port == 853 && matches!(&config.protocol,
+                    crate::config::ProtocolConfig::Tls { server_name } if server_name == &required.server_name)
+            })
+        }
+        #[cfg(not(feature = "__tls"))]
+        {
+            let _ = cx;
+            false
+        }
     }
 
     pub(super) fn ip(&self) -> IpAddr {
@@ -591,6 +631,8 @@ struct ConnectionState<P: ConnectionProvider> {
     protocol: Protocol,
     handle: P::Conn,
     meta: Arc<ConnectionMeta>,
+    #[cfg(feature = "__tls")]
+    tls_identity: Option<crate::connection_provider::TlsConfigIdentity>,
 }
 
 impl<P: ConnectionProvider> ConnectionState<P> {
@@ -599,6 +641,8 @@ impl<P: ConnectionProvider> ConnectionState<P> {
             protocol,
             handle,
             meta: Arc::new(ConnectionMeta::default()),
+            #[cfg(feature = "__tls")]
+            tls_identity: None,
         }
     }
 }
@@ -810,6 +854,7 @@ impl From<u8> for Status {
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
 pub(crate) struct ConnectionPolicy {
     pub(crate) disable_udp: bool,
+    pub(crate) require_tls: bool,
 }
 
 impl ConnectionPolicy {
@@ -888,6 +933,16 @@ impl ConnectionPolicy {
 
     /// Checks if the given protocol is allowed by current policy.
     fn allows_protocol(&self, protocol: Protocol) -> bool {
+        if self.require_tls {
+            #[cfg(feature = "__tls")]
+            {
+                return protocol == Protocol::Tls;
+            }
+            #[cfg(not(feature = "__tls"))]
+            {
+                return false;
+            }
+        }
         !(self.disable_udp && protocol == Protocol::Udp)
     }
 

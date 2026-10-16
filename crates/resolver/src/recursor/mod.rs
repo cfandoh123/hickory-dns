@@ -624,6 +624,22 @@ pub struct RecursiveConfig {
 pub struct ForcedEncryptedAuthoritativeConfig {
     /// Authoritative servers covered by this policy
     pub servers: Vec<ForcedEncryptedAuthoritativeServerConfig>,
+    /// Trusted zone-to-server bindings. Each binding protects the zone and its
+    /// descendants; a more specific binding takes precedence.
+    #[serde(default)]
+    pub zones: Vec<ForcedEncryptedAuthoritativeZoneConfig>,
+}
+
+/// Local authorization for an authoritative server to answer a protected zone.
+/// Addresses come only from the referenced, validated server entries.
+#[cfg(feature = "serde")]
+#[derive(Clone, Deserialize, Eq, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ForcedEncryptedAuthoritativeZoneConfig {
+    /// Protected zone name (not a wildcard).
+    pub name: Name,
+    /// Approved nameserver identities from `servers`.
+    pub servers: Vec<Name>,
 }
 
 #[cfg(feature = "serde")]
@@ -784,7 +800,55 @@ impl TryFrom<ForcedEncryptedAuthoritativeConfig> for ForcedEncryptedAuthoritativ
             servers.insert(server.address, server);
         }
 
-        Ok(Self { servers })
+        let mut zones = HashMap::new();
+        for binding in config.zones {
+            let mut name = binding.name.to_lowercase();
+            name.set_fqdn(true);
+            if name.iter().any(|label| label == b"*") {
+                return Err(ForcedEncryptedAuthoritativePolicyError::InvalidZone {
+                    name,
+                    reason: "wildcard zones are not supported",
+                });
+            }
+            if binding.servers.is_empty() {
+                return Err(ForcedEncryptedAuthoritativePolicyError::InvalidZone {
+                    name,
+                    reason: "at least one approved server is required",
+                });
+            }
+            let mut addresses = Vec::new();
+            for configured_name in binding.servers {
+                let tls_name = configured_name
+                    .to_ascii()
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase();
+                let found = servers
+                    .values()
+                    .filter(|server| server.tls_name == tls_name)
+                    .map(|server| server.address)
+                    .collect::<Vec<_>>();
+                if found.is_empty() {
+                    return Err(ForcedEncryptedAuthoritativePolicyError::UnknownZoneServer {
+                        name,
+                        server: configured_name,
+                    });
+                }
+                addresses.extend(found);
+            }
+            addresses.sort_unstable();
+            addresses.dedup();
+            if let Some(previous) = zones.get(&name) {
+                if previous != &addresses {
+                    return Err(ForcedEncryptedAuthoritativePolicyError::InvalidZone {
+                        name,
+                        reason: "conflicting approved server lists",
+                    });
+                }
+            } else {
+                zones.insert(name, addresses);
+            }
+        }
+        Ok(Self { servers, zones })
     }
 }
 
@@ -852,6 +916,22 @@ impl ForcedEncryptedAuthoritativeServerConfig {
 #[cfg(feature = "serde")]
 #[derive(Debug, thiserror::Error)]
 pub enum ForcedEncryptedAuthoritativePolicyError {
+    /// A local zone requirement is malformed or conflicting.
+    #[error("invalid authenticated zone policy for {name}: {reason}")]
+    InvalidZone {
+        /// Protected zone.
+        name: Name,
+        /// Validation failure.
+        reason: &'static str,
+    },
+    /// A zone binding refers to a server without a validated endpoint policy.
+    #[error("authenticated zone {name} references unknown server {server}")]
+    UnknownZoneServer {
+        /// Protected zone.
+        name: Name,
+        /// Unconfigured nameserver identity.
+        server: Name,
+    },
     /// A server entry cannot be matched by address
     #[error("missing address for authoritative server {name}")]
     MissingServerAddress {
@@ -945,10 +1025,21 @@ impl ForcedEncryptedAuthoritativeServerPolicy {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ForcedEncryptedAuthoritativePolicy {
     servers: HashMap<IpAddr, ForcedEncryptedAuthoritativeServerPolicy>,
+    zones: HashMap<Name, Vec<IpAddr>>,
 }
 
 #[cfg(feature = "serde")]
 impl ForcedEncryptedAuthoritativePolicy {
+    pub(crate) fn zone_for(&self, name: &Name) -> Option<(&Name, &[IpAddr])> {
+        let mut name = name.to_lowercase();
+        name.set_fqdn(true);
+        self.zones
+            .iter()
+            .filter(|(zone, _)| is_subzone(zone, &name))
+            .max_by_key(|(zone, _)| zone.num_labels())
+            .map(|(zone, servers)| (zone, servers.as_slice()))
+    }
+
     pub(crate) fn server_for(
         &self,
         ip: IpAddr,

@@ -193,7 +193,7 @@ impl ResolverConfig {
 }
 
 /// Configuration for the NameServer
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[cfg_attr(
     feature = "serde",
     derive(Serialize, Deserialize),
@@ -331,7 +331,7 @@ fn default_trust_negative_responses() -> bool {
 }
 
 /// Configuration for a connection to a nameserver
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[non_exhaustive]
 pub struct ConnectionConfig {
@@ -419,7 +419,7 @@ impl<'de> Deserialize<'de> for ConnectionConfig {
 
 /// Protocol configuration
 #[allow(missing_docs)]
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
 #[cfg_attr(
     feature = "serde",
     derive(Serialize, Deserialize),

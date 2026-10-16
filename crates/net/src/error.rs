@@ -32,6 +32,19 @@ use crate::proto::serialize::binary::DecodeError;
 #[non_exhaustive]
 #[derive(Error, Clone, Debug)]
 pub enum NetError {
+    /// A configured authenticated transport failed. Retrying another approved
+    /// endpoint is allowed; weakening its security requirements is not.
+    #[error("required authenticated transport to {server} failed: {source}")]
+    RequiredTransportFailure {
+        /// Endpoint whose required transport failed.
+        server: std::net::IpAddr,
+        /// Original transport or certificate error.
+        source: Arc<NetError>,
+    },
+
+    /// Trusted local security requirements could not be satisfied.
+    #[error("security policy failure: {0}")]
+    SecurityPolicy(Arc<str>),
     /// The underlying resource is too busy
     ///
     /// This is a signal that an internal resource is too busy. The intended action should be tried
@@ -150,6 +163,14 @@ pub enum NetError {
 }
 
 impl NetError {
+    /// Whether the error must not be recovered by using an unprotected path.
+    pub fn is_security_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::RequiredTransportFailure { .. } | Self::SecurityPolicy(_)
+        )
+    }
+
     /// Returns true if the domain does not exist
     #[inline]
     pub fn is_nx_domain(&self) -> bool {
@@ -210,6 +231,8 @@ impl NetError {
     /// Returns a representative string of the error for use as a metrics label.
     pub fn as_metrics_label(&self) -> &'static str {
         match self {
+            Self::RequiredTransportFailure { .. } => "required_transport_failure",
+            Self::SecurityPolicy(_) => "security_policy",
             Self::Busy => "busy",
             #[cfg(any(feature = "__https", feature = "__h3"))]
             Self::Decode(_) => "http_header_decode",

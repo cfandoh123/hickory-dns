@@ -80,6 +80,21 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
         cx: &PoolContext,
     ) -> Result<Self::FutureConn, NetError> {
         let remote_addr = SocketAddr::new(ip, config.port);
+        #[cfg(feature = "__tls")]
+        if let Some(required) = cx.server_tls_configs.get(&ip) {
+            if config.port != 853
+                || !matches!(&config.protocol,
+                ProtocolConfig::Tls { server_name } if server_name == &required.server_name)
+            {
+                return Err(NetError::SecurityPolicy(
+                    format!(
+                        "endpoint {ip} requires DoT on port 853 with identity {}",
+                        required.server_name,
+                    )
+                    .into(),
+                ));
+            }
+        }
         match (&config.protocol, self.quic_binder()) {
             (ProtocolConfig::Udp, _) => {
                 let (timeout, os_port_selection, avoid_local_udp_ports, bind_addr, provider) = (
@@ -118,6 +133,7 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
                 let server_name = server_name.to_owned();
                 let expected_name = server_name.to_str().into_owned();
                 let required = cx.server_tls_configs.contains_key(&ip);
+                let connect_budget = cx.options.connect_timeout.min(cx.options.timeout);
                 let connecting = tls_exchange(
                     remote_addr,
                     config.bind_addr,
@@ -129,7 +145,15 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
                     self.clone(),
                 );
                 Ok(Box::pin(async move {
-                    let result = connecting.await;
+                    let result = match <P::Timer as crate::net::runtime::Time>::timeout(
+                        connect_budget,
+                        connecting,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(NetError::Timeout),
+                    };
                     if required {
                         match &result {
                             Ok(_) => {
@@ -140,7 +164,14 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
                             }
                         }
                     }
-                    result
+                    if required {
+                        result.map_err(|source| NetError::RequiredTransportFailure {
+                            server: ip,
+                            source: Arc::new(source),
+                        })
+                    } else {
+                        result
+                    }
                 }))
             }
             #[cfg(feature = "__https")]
@@ -219,6 +250,50 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
     fn runtime_provider(&self) -> &Self::RuntimeProvider {
         self
     }
+}
+
+/// An identity tied to one immutable TLS configuration for its entire lifetime.
+#[cfg(feature = "__tls")]
+#[derive(Clone)]
+pub(crate) struct TlsConfigIdentity(Arc<rustls::ClientConfig>);
+
+#[cfg(feature = "__tls")]
+impl TlsConfigIdentity {
+    pub(crate) fn new(config: rustls::ClientConfig) -> Self {
+        Self(Arc::new(config))
+    }
+    pub(crate) fn config(&self) -> &rustls::ClientConfig {
+        &self.0
+    }
+}
+
+// The Arc keeps this identity alive in connection states and cache keys, so its
+// address cannot be recycled while a cached entry still references it.
+#[cfg(feature = "__tls")]
+impl PartialEq for TlsConfigIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+#[cfg(feature = "__tls")]
+impl Eq for TlsConfigIdentity {}
+#[cfg(feature = "__tls")]
+impl std::hash::Hash for TlsConfigIdentity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(Arc::as_ptr(&self.0), state);
+    }
+}
+#[cfg(feature = "__tls")]
+impl std::fmt::Debug for TlsConfigIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TlsConfigIdentity(..)")
+    }
+}
+
+#[cfg(feature = "__tls")]
+pub(crate) struct ServerTlsConfig {
+    pub(crate) server_name: Arc<str>,
+    pub(crate) identity: TlsConfigIdentity,
 }
 
 /// TLS configuration for the connection provider.
