@@ -1,8 +1,9 @@
 # Authenticated authoritative DNS
 
 This branch extends the authoritative transport configuration introduced by Grace
-Helena Cimaszewski. It uses Hickory's existing TLS transport and Rustls verifier to
-require authenticated DNS-over-TLS (DoT) for configured endpoints.
+Helena Cimaszewski. It uses Hickory's existing DoT/QUIC transports and Rustls verifier to
+require authenticated DNS-over-TLS (DoT) or DNS-over-QUIC (DoQ) for configured
+endpoints.
 
 ## Configuration and startup validation
 
@@ -17,7 +18,7 @@ Each `servers` entry has:
 |---|---|
 | `name` | Expected concrete DNS identity, used for certificate verification and SNI |
 | `address` | Explicit IPv4 or IPv6 endpoint address |
-| `protocol` | `dot`; strict DoQ is currently rejected |
+| `protocol` | `dot` with TLS support, or `doq` with QUIC support enabled in the build |
 | `trust_anchor` | One or more PEM certificates used as the endpoint's explicit trust roots |
 
 Names are compared case-insensitively with a trailing dot ignored for TLS identity.
@@ -56,7 +57,9 @@ curated channel authentication, not automatic public-Internet endpoint discovery
 
 ## Connection, retry and cache invariants
 
-- Required endpoints use DoT on port 853 with the configured DNS identity.
+- Required endpoints use their configured protocol on port 853: DoT over TCP
+  or DoQ over UDP, with the configured DNS identity. DoQ cannot fall back to DoT
+  or plaintext, and DoT cannot substitute DoQ.
 - Required pools filter endpoints before ordering, racing or retrying. They may
   retry another approved secure endpoint but must not fall back to plaintext.
 - Per-endpoint Rustls configurations contain the supplied trust roots. Their
@@ -70,8 +73,8 @@ curated channel authentication, not automatic public-Internet endpoint discovery
   mistaken for an absent zone cut or a reason to try an insecure path.
 
 The optional `connect_timeout_ms` recursor setting bounds connection establishment,
-including the TLS handshake. It must be positive. When absent, existing timeout
-defaults remain in effect. A connection budget shorter than a client's DNS
+including TLS authentication in either transport. It must be positive. When absent,
+existing timeout defaults remain in effect. A connection budget shorter than a client's DNS
 deadline leaves time to try an approved backup; a full pool deadline still bounds
 overall retries.
 
@@ -81,11 +84,12 @@ overall retries.
 |---|---|
 | `src/recursor/mod.rs` | Raw configuration, validation, trust parsing and runtime policy |
 | `src/recursor/handle.rs` | Policy lookup, pools, referrals, dependencies and response-cache separation |
-| `src/connection_provider.rs` | Native TLS connection guard, verifier selection and typed failures |
+| `src/connection_provider.rs` | Native DoT/DoQ endpoint guards, verifier selection and typed failures |
 | `src/name_server.rs` | Connection selection and trust-aware reuse |
 | `src/name_server_pool.rs` | Approved endpoint filtering, deadlines and retries |
 | `src/recursor/security_tests.rs` | Mock-provider selection/cache/referral tests |
 | `src/recursor/tests/authenticated_dot.rs` | Real loopback TLS verification and timeout tests |
+| `src/recursor/tests/authenticated_doq.rs` | Real QUIC certificate, SNI/ALPN, reuse, timeout and no-fallback tests |
 
 Run the library checks from the repository root:
 
@@ -93,6 +97,41 @@ Run the library checks from the repository root:
 cargo test --locked --offline -p hickory-resolver --lib \
   --features recursor,serde,toml,dnssec-ring,tls-ring
 ```
+
+To include strict DoQ, enable a QUIC feature (which also enables TLS):
+
+```sh
+cargo test --locked --offline -p hickory-resolver --lib \
+  --features recursor,serde,toml,dnssec-ring,quic-ring
+
+cargo build --locked --offline -p hickory-dns --bin hickory-dns --no-default-features \
+  --features recursor,dnssec-ring,quic-ring
+```
+
+`quic-aws-lc-rs` is the alternative QUIC crypto-provider feature. A build without
+QUIC support still rejects `doq` policies at startup; it does not change their
+meaning to DoT or plaintext. Keep the same `name`, `address` and `trust_anchor`
+fields when changing an endpoint's required `protocol` from `dot` to `doq`.
+The authority must actually serve DoQ on UDP 853 and negotiate the `doq` ALPN.
+
+QUIC uses the endpoint's independent Rustls verifier, not the shared opportunistic
+verifier. Required QUIC connections disable early data, wait for the authenticated
+handshake and carry the same immutable trust identity used for DoT reuse checks.
+Binding errors, unavailable runtime QUIC support and handshake failures remain
+typed security failures. Protocol checks also run before connection creation.
+
+Real QUIC tests use unprivileged loopback ports through a datagram address adapter.
+They verify valid certificates, wrong names, wrong CAs, expired certificates,
+bounded stalled handshakes, authenticated NXDOMAIN, verified connection reuse,
+real certificate-failure failover and certificate verification after reconnecting.
+Independent plaintext and opportunistic QUIC queries establish that rejection
+tests use reachable servers. Decision tests additionally cover approved backup
+selection, referrals with and without glue, CNAME dependencies, protocol filtering
+and rejection of weak or differently trusted cached connections.
+
+The earlier Docker/ACME and performance result folders describe the DoT build
+tested at that time. These new QUIC tests do not turn those historical measurements
+into DoQ issuance or performance results.
 
 The certificate material under `tests/test-data/authenticated-dot` is explicitly
 public test data. Its checked-in server key must never be used for a deployment.
