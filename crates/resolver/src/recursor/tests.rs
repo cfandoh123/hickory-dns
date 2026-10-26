@@ -1388,8 +1388,9 @@ mod policy_validation {
         ));
     }
 
+    #[cfg(not(feature = "__quic"))]
     #[test]
-    fn doq_is_rejected_even_when_quic_is_available() {
+    fn doq_is_rejected_without_quic_support() {
         let mut entry = server();
         entry.protocol = Protocol::Doq;
         assert!(matches!(
@@ -1399,6 +1400,18 @@ mod policy_validation {
                 ..
             })
         ));
+    }
+
+    #[cfg(feature = "__quic")]
+    #[test]
+    fn doq_is_accepted_when_quic_is_available() {
+        let mut entry = server();
+        entry.protocol = Protocol::Doq;
+        let policy = convert(vec![entry]).unwrap();
+        assert_eq!(
+            policy.servers.values().next().unwrap().protocol,
+            Protocol::Doq
+        );
     }
 
     #[cfg(not(feature = "__tls"))]
@@ -1647,6 +1660,30 @@ mod policy_wiring {
         assert_retained_policy(&recursor);
     }
 
+    #[cfg(feature = "__quic")]
+    #[test]
+    fn from_config_retains_required_doq_and_its_verifier() {
+        let mut value: serde_json::Value = serde_json::from_str(&policy_json()).unwrap();
+        value["servers"][0]["protocol"] = "doq".into();
+        let (recursor, provider) = configured_recursor(
+            Some(&value.to_string()),
+            DnssecPolicyConfig::SecurityUnaware,
+        );
+        let handle = lookup_handle(&recursor);
+        assert_eq!(
+            handle
+                .authoritative_server_policy(LEAF_IP)
+                .unwrap()
+                .protocol,
+            crate::recursor::ForcedEncryptedAuthoritativeProtocol::Doq
+        );
+        let context = handle.pool_context();
+        let endpoint = &context.server_tls_configs[&LEAF_IP];
+        assert_eq!(endpoint.protocol, Protocol::Quic);
+        assert_eq!(&*endpoint.server_name, "ns.hickory-dns.testing");
+        assert!(provider.new_connection_calls().is_empty());
+    }
+
     #[cfg(all(feature = "__dnssec", feature = "__tls"))]
     #[test]
     fn from_config_retains_authoritative_policy_in_dnssec_modes() {
@@ -1698,9 +1735,12 @@ mod policy_wiring {
     fn from_config_rejects_invalid_policies_before_connecting() {
         let base: serde_json::Value = serde_json::from_str(&policy_json()).unwrap();
         let mut cases = vec![];
-        let mut doq = base.clone();
-        doq["servers"][0]["protocol"] = "doq".into();
-        cases.push((doq.to_string(), "unsupported required protocol"));
+        #[cfg(not(feature = "__quic"))]
+        {
+            let mut doq = base.clone();
+            doq["servers"][0]["protocol"] = "doq".into();
+            cases.push((doq.to_string(), "unsupported required protocol"));
+        }
         let mut missing_address = base.clone();
         missing_address["servers"][0]
             .as_object_mut()

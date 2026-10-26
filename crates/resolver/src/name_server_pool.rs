@@ -550,12 +550,14 @@ impl PoolContext {
         mut self,
         ip: IpAddr,
         server_name: Arc<str>,
+        protocol: Protocol,
         config: rustls::ClientConfig,
     ) -> Self {
         self.server_tls_configs.insert(
             ip,
             crate::connection_provider::ServerTlsConfig {
                 server_name,
+                protocol,
                 identity: crate::connection_provider::TlsConfigIdentity::new(config),
             },
         );

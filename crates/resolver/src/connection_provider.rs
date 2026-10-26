@@ -84,14 +84,11 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
         // Defend the connection boundary as well as pool selection: callers
         // must not reach a configured endpoint using a weaker protocol or name.
         if let Some(required) = cx.server_tls_configs.get(&ip) {
-            if config.port != 853
-                || !matches!(&config.protocol,
-                ProtocolConfig::Tls { server_name } if server_name == &required.server_name)
-            {
+            if !required.matches(config) {
                 return Err(NetError::SecurityPolicy(
                     format!(
-                        "endpoint {ip} requires DoT on port 853 with identity {}",
-                        required.server_name,
+                        "endpoint {ip} requires {:?} on port 853 with identity {}",
+                        required.protocol, required.server_name,
                     )
                     .into(),
                 ));
@@ -200,17 +197,56 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
                     SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
                 });
 
-                Ok(Box::pin(
-                    QuicClientStream::builder()
-                        .crypto_config(cx.tls.clone())
-                        .connect_timeout(cx.options.connect_timeout)
-                        .exchange(
-                            binder.bind_quic(bind_addr, remote_addr)?,
-                            remote_addr,
-                            server_name.clone(),
-                            self.clone(),
-                        ),
-                ))
+                let required = cx.server_tls_configs.contains_key(&ip);
+                let expected_name = server_name.clone();
+                // QUIC carries TLS 1.3: use the endpoint verifier rather than
+                // the opportunistic verifier, and wait for authentication before
+                // publishing a reusable connection (early data stays disabled).
+                let mut tls = cx.tls_config_for_server(ip).clone();
+                if required {
+                    tls.enable_early_data = false;
+                }
+                let budget = cx.options.connect_timeout.min(cx.options.timeout);
+                let socket = binder.bind_quic(bind_addr, remote_addr).map_err(|source| {
+                    let source = NetError::from(source);
+                    if required {
+                        NetError::RequiredTransportFailure {
+                            server: ip,
+                            source: Arc::new(source),
+                        }
+                    } else {
+                        source
+                    }
+                })?;
+                let connecting = QuicClientStream::builder()
+                    .crypto_config(tls)
+                    .connect_timeout(budget)
+                    .exchange(socket, remote_addr, server_name.clone(), self.clone());
+                Ok(Box::pin(async move {
+                    let result =
+                        match <P::Timer as crate::net::runtime::Time>::timeout(budget, connecting)
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err(NetError::Timeout),
+                        };
+                    if required {
+                        match &result {
+                            Ok(_) => {
+                                debug!(%ip, %expected_name, "authenticated authoritative DoQ connected")
+                            }
+                            Err(error) => {
+                                warn!(%ip, %expected_name, %error, "required authoritative DoQ connection failed")
+                            }
+                        }
+                        result.map_err(|source| NetError::RequiredTransportFailure {
+                            server: ip,
+                            source: Arc::new(source),
+                        })
+                    } else {
+                        result
+                    }
+                }))
             }
             #[cfg(feature = "__h3")]
             (
@@ -242,7 +278,15 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
             }
             #[cfg(feature = "__quic")]
             (ProtocolConfig::Quic { .. }, None) => {
-                Err(NetError::from("runtime provider does not support QUIC"))
+                let source = NetError::from("runtime provider does not support QUIC");
+                Err(if cx.server_tls_configs.contains_key(&ip) {
+                    NetError::RequiredTransportFailure {
+                        server: ip,
+                        source: Arc::new(source),
+                    }
+                } else {
+                    source
+                })
             }
             #[cfg(feature = "__h3")]
             (ProtocolConfig::H3 { .. }, None) => {
@@ -299,10 +343,27 @@ impl std::fmt::Debug for TlsConfigIdentity {
 /// One configured endpoint's expected DNS identity and independent verifier settings.
 #[cfg(feature = "__tls")]
 pub(crate) struct ServerTlsConfig {
+    /// Required transport; encryption alone must not permit a protocol downgrade.
+    pub(crate) protocol: crate::net::xfer::Protocol,
     /// Canonical identity used for certificate checks and SNI.
     pub(crate) server_name: Arc<str>,
     /// Shared trust settings used to distinguish reusable authenticated sessions.
     pub(crate) identity: TlsConfigIdentity,
+}
+
+#[cfg(feature = "__tls")]
+impl ServerTlsConfig {
+    /// Check the complete endpoint requirement before opening or admitting a connection.
+    pub(crate) fn matches(&self, config: &ConnectionConfig) -> bool {
+        config.port == 853
+            && config.protocol.to_protocol() == self.protocol
+            && match &config.protocol {
+                ProtocolConfig::Tls { server_name } => server_name == &self.server_name,
+                #[cfg(feature = "__quic")]
+                ProtocolConfig::Quic { server_name } => server_name == &self.server_name,
+                _ => false,
+            }
+    }
 }
 
 /// TLS configuration for the connection provider.

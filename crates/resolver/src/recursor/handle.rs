@@ -185,9 +185,18 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                     roots: server.trust_roots.clone(),
                 })
                 .with_no_client_auth();
+                let protocol = name_server_config(
+                    server.address,
+                    &pool_context.opportunistic_encryption,
+                    Some(server),
+                )
+                .connections[0]
+                    .protocol
+                    .to_protocol();
                 pool_context = pool_context.with_server_tls_config(
                     server.address,
                     Arc::from(server.tls_name.as_str()),
+                    protocol,
                     tls,
                 );
             }
@@ -259,7 +268,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             .and_then(|policy| policy.server_for(ip))
     }
 
-    /// Choose required DoT for a configured endpoint before considering opportunistic defaults.
+    /// Choose the required authenticated transport before considering opportunistic defaults.
     fn name_server_config(&self, ip: IpAddr) -> NameServerConfig {
         name_server_config(
             ip,
@@ -1328,8 +1337,13 @@ fn name_server_config(
             ForcedEncryptedAuthoritativeProtocol::Dot => {
                 NameServerConfig::tls(ip, Arc::from(required.tls_name.as_str()))
             }
+            #[cfg(feature = "__quic")]
             ForcedEncryptedAuthoritativeProtocol::Doq => {
-                unreachable!("required DoQ is rejected during startup validation")
+                NameServerConfig::quic(ip, Arc::from(required.tls_name.as_str()))
+            }
+            #[cfg(not(feature = "__quic"))]
+            ForcedEncryptedAuthoritativeProtocol::Doq => {
+                unreachable!("required DoQ needs QUIC support, checked during startup validation")
             }
         };
     }

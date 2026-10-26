@@ -984,7 +984,12 @@ fn client_tls(ca: &str) -> rustls::ClientConfig {
 async fn native_provider_rejects_wrong_protocol_port_and_name_before_connecting() {
     let provider = TokioRuntimeProvider::new();
     let cx = PoolContext::new(ResolverOpts::default(), TlsConfig::new().unwrap())
-        .with_server_tls_config(PRIMARY, Arc::from(PRIMARY_NAME), client_tls(CA));
+        .with_server_tls_config(
+            PRIMARY,
+            Arc::from(PRIMARY_NAME),
+            Protocol::Tls,
+            client_tls(CA),
+        );
     let mut wrong_port =
         NameServerConfig::tls(PRIMARY, Arc::from(PRIMARY_NAME)).connections[0].clone();
     wrong_port.port = 8853;
@@ -1067,6 +1072,7 @@ async fn weak_connections_and_connections_with_another_trust_policy_are_not_reus
             .with_server_tls_config(
                 PRIMARY,
                 Arc::from(PRIMARY_NAME),
+                Protocol::Tls,
                 client_tls(ROGUE),
             ),
         );
@@ -1105,7 +1111,12 @@ async fn stalled_approved_connections_obey_the_pool_deadline() {
             },
             TlsConfig::new().unwrap(),
         )
-        .with_server_tls_config(PRIMARY, Arc::from(PRIMARY_NAME), client_tls(CA)),
+        .with_server_tls_config(
+            PRIMARY,
+            Arc::from(PRIMARY_NAME),
+            Protocol::Tls,
+            client_tls(CA),
+        ),
     );
     let pool = NameServerPool::from_config(
         [NameServerConfig::tls(PRIMARY, Arc::from(PRIMARY_NAME))],

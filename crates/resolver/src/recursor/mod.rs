@@ -748,10 +748,12 @@ impl TryFrom<ForcedEncryptedAuthoritativeConfig> for ForcedEncryptedAuthoritativ
                 );
             };
 
-            // Strict DoQ is deferred, even if opportunistic QUIC is compiled in.
-            if server.protocol != ForcedEncryptedAuthoritativeProtocol::Dot
-                || !cfg!(feature = "__tls")
-            {
+            // Reject unavailable transports before any endpoint can be selected.
+            let supported = match server.protocol {
+                ForcedEncryptedAuthoritativeProtocol::Dot => cfg!(feature = "__tls"),
+                ForcedEncryptedAuthoritativeProtocol::Doq => cfg!(feature = "__quic"),
+            };
+            if !supported {
                 return Err(
                     ForcedEncryptedAuthoritativePolicyError::UnsupportedProtocol {
                         name: server.name,
@@ -965,7 +967,7 @@ pub enum ForcedEncryptedAuthoritativePolicyError {
     },
     /// The required transport is not supported by this implementation/build.
     #[error(
-        "unsupported required protocol {protocol:?} for authoritative server {name}: only DoT with TLS enabled is supported"
+        "unsupported required protocol {protocol:?} for authoritative server {name}: enable TLS for DoT or QUIC for DoQ"
     )]
     UnsupportedProtocol {
         /// Server name from the policy

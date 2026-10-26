@@ -272,7 +272,11 @@ impl<P: ConnectionProvider> NameServer<P> {
             .map(|server| &server.identity);
         #[cfg(feature = "__tls")]
         let policy = ConnectionPolicy {
-            require_tls: policy.require_tls || required_identity.is_some(),
+            required_protocol: cx
+                .server_tls_configs
+                .get(&self.config.ip)
+                .map(|server| server.protocol)
+                .or(policy.required_protocol),
             ..policy
         };
         // Check for an existing usable connection (short lock)
@@ -361,17 +365,19 @@ impl<P: ConnectionProvider> NameServer<P> {
             .map(|conn| conn.protocol.to_protocol())
     }
 
-    /// Whether this endpoint has both required TLS settings and a matching TLS protocol.
+    /// Whether every configured connection matches the endpoint authentication requirement.
     pub(crate) fn can_authenticate(&self, cx: &PoolContext) -> bool {
         #[cfg(feature = "__tls")]
         {
             let Some(required) = cx.server_tls_configs.get(&self.config.ip) else {
                 return false;
             };
-            !self.config.connections.is_empty() && self.config.connections.iter().all(|config| {
-                config.port == 853 && matches!(&config.protocol,
-                    crate::config::ProtocolConfig::Tls { server_name } if server_name == &required.server_name)
-            })
+            !self.config.connections.is_empty()
+                && self
+                    .config
+                    .connections
+                    .iter()
+                    .all(|config| required.matches(config))
         }
         #[cfg(not(feature = "__tls"))]
         {
@@ -857,7 +863,8 @@ impl From<u8> for Status {
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
 pub(crate) struct ConnectionPolicy {
     pub(crate) disable_udp: bool,
-    pub(crate) require_tls: bool,
+    /// A required transport also filters established sessions and retries.
+    pub(crate) required_protocol: Option<Protocol>,
 }
 
 impl ConnectionPolicy {
@@ -936,15 +943,8 @@ impl ConnectionPolicy {
 
     /// Checks if the given protocol is allowed by current policy.
     fn allows_protocol(&self, protocol: Protocol) -> bool {
-        if self.require_tls {
-            #[cfg(feature = "__tls")]
-            {
-                return protocol == Protocol::Tls;
-            }
-            #[cfg(not(feature = "__tls"))]
-            {
-                return false;
-            }
+        if let Some(required) = self.required_protocol {
+            return protocol == required;
         }
         !(self.disable_udp && protocol == Protocol::Udp)
     }
