@@ -25,6 +25,9 @@ use crate::{
 #[cfg(all(feature = "serde", feature = "__tls"))]
 mod authenticated_dot;
 
+#[cfg(all(feature = "serde", feature = "__quic"))]
+mod authenticated_doq;
+
 #[tokio::test]
 async fn recursor_connection_deduplication() -> Result<(), NetError> {
     subscribe();

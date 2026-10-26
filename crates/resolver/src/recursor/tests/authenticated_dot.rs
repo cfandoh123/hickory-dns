@@ -47,18 +47,21 @@ use crate::{
     },
 };
 
-const CA: &str = include_str!("../../../../../tests/test-data/authenticated-dot/ca.pem");
-const ROGUE_CA: &str =
+pub(super) const CA: &str = include_str!("../../../../../tests/test-data/authenticated-dot/ca.pem");
+pub(super) const ROGUE_CA: &str =
     include_str!("../../../../../tests/test-data/authenticated-dot/rogue-ca.pem");
-const VALID: &str = include_str!("../../../../../tests/test-data/authenticated-dot/valid.pem");
-const WRONG_NAME: &str =
+pub(super) const VALID: &str =
+    include_str!("../../../../../tests/test-data/authenticated-dot/valid.pem");
+pub(super) const WRONG_NAME: &str =
     include_str!("../../../../../tests/test-data/authenticated-dot/wrong-name.pem");
-const UNTRUSTED: &str =
+pub(super) const UNTRUSTED: &str =
     include_str!("../../../../../tests/test-data/authenticated-dot/untrusted.pem");
-const EXPIRED: &str = include_str!("../../../../../tests/test-data/authenticated-dot/expired.pem");
-const KEY: &str = include_str!("../../../../../tests/test-data/authenticated-dot/server.key");
-const IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-const EXPECTED_NAME: &str = "ns.auth-dot.test";
+pub(super) const EXPIRED: &str =
+    include_str!("../../../../../tests/test-data/authenticated-dot/expired.pem");
+pub(super) const KEY: &str =
+    include_str!("../../../../../tests/test-data/authenticated-dot/server.key");
+pub(super) const IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+pub(super) const EXPECTED_NAME: &str = "ns.auth-dot.test";
 
 #[tokio::test]
 async fn configured_timeout_bounds_a_real_stalled_tls_handshake() {
@@ -223,7 +226,7 @@ impl ConnectionProvider for ObservedProvider {
     }
 }
 
-fn answer(request: Message) -> Message {
+pub(super) fn answer(request: Message) -> Message {
     let query = request.queries[0].clone();
     let mut response = request.into_response();
     response.authoritative = true;
@@ -269,7 +272,7 @@ async fn serve_dns<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) -> io::Resu
     }
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     tls: SocketAddr,
     plain: SocketAddr,
     names: Arc<Mutex<Vec<Option<String>>>>,
@@ -286,7 +289,7 @@ impl Drop for Fixture {
 }
 
 impl Fixture {
-    async fn start(certificate: &str) -> Self {
+    pub(super) async fn start(certificate: &str) -> Self {
         let tls_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let plain_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let tls = tls_listener.local_addr().unwrap();
@@ -392,7 +395,7 @@ impl Fixture {
         (recursor, provider)
     }
 
-    async fn plaintext_controls(&self) {
+    pub(super) async fn plaintext_controls(&self) {
         let query = Query::new(
             Name::from_ascii("host.auth-dot.test.").unwrap(),
             RecordType::A,

@@ -1133,3 +1133,303 @@ async fn stalled_approved_connections_obey_the_pool_deadline() {
     .expect("pool failed to enforce its deadline");
     assert!(matches!(result, Err(NetError::Timeout)));
 }
+
+/// Decision tests deliberately use a mock provider; real QUIC authentication is
+/// verified separately in tests/authenticated_doq.rs.
+#[cfg(feature = "__quic")]
+mod doq {
+    use super::*;
+
+    fn resolver(
+        provider: &Provider,
+        mut config: serde_json::Value,
+        opportunistic: bool,
+    ) -> Recursor<Provider> {
+        for server in config["servers"].as_array_mut().unwrap() {
+            server["protocol"] = serde_json::json!("doq");
+        }
+        let policy = ForcedEncryptedAuthoritativePolicy::try_from(
+            serde_json::from_value::<ForcedEncryptedAuthoritativeConfig>(config).unwrap(),
+        )
+        .unwrap();
+        let mut options = RecursorOptions {
+            deny_server: vec![],
+            ..Default::default()
+        };
+        if opportunistic {
+            options.opportunistic_encryption = OpportunisticEncryption::Enabled {
+                config: OpportunisticEncryptionConfig {
+                    max_concurrent_probes: 0,
+                    ..Default::default()
+                },
+            };
+        }
+        Recursor::new_with_policy(
+            &[ROOT],
+            DnssecPolicy::SecurityUnaware,
+            None,
+            options,
+            provider.clone(),
+            Some(Arc::new(policy)),
+        )
+        .unwrap()
+    }
+
+    fn assert_doq_only(provider: &Provider) {
+        let calls = provider.state.calls.lock().unwrap();
+        assert!(!calls.is_empty());
+        for call in calls.iter() {
+            assert!(matches!(call.config.protocol, ProtocolConfig::Quic { .. }));
+            assert_eq!(call.config.port, 853);
+            assert!(call.identity.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_quic_backup_is_used_without_trying_plaintext_or_parent() {
+        for opportunistic in [false, true] {
+            for failure in [Failure::Certificate, Failure::Refused] {
+                let provider = Provider::new(response);
+                provider.fail(PRIMARY, failure);
+                let recursor = resolver(
+                    &provider,
+                    policy(binding(&[PRIMARY_NAME, SECONDARY_NAME])),
+                    opportunistic,
+                );
+                let handle = handle(&recursor);
+                handle
+                    .cached_name_server(&handle.name_server_config(SECONDARY))
+                    .record_cancelled(Duration::from_millis(50));
+                good(&lookup(&recursor, "host.bound.test.").await.unwrap());
+                assert!(provider.called(PRIMARY));
+                assert!(provider.called(SECONDARY));
+                assert!(!provider.called(ROOT));
+                assert!(!provider.called(PLAIN));
+                assert_doq_only(&provider);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn all_quic_endpoints_failing_is_a_security_failure() {
+        let provider = Provider::new(response);
+        provider.fail(PRIMARY, Failure::Certificate);
+        provider.fail(SECONDARY, Failure::Refused);
+        let recursor = resolver(
+            &provider,
+            policy(binding(&[PRIMARY_NAME, SECONDARY_NAME])),
+            true,
+        );
+        assert!(
+            lookup(&recursor, "host.bound.test.")
+                .await
+                .unwrap_err()
+                .is_security_failure()
+        );
+        assert!(provider.called(PRIMARY));
+        assert!(provider.called(SECONDARY));
+        assert!(!provider.called(ROOT));
+        assert_doq_only(&provider);
+    }
+
+    #[tokio::test]
+    async fn strict_quic_pool_filters_plaintext_and_wrong_encrypted_protocol() {
+        let provider = Provider::new(response);
+        let recursor = resolver(&provider, policy(binding(&[PRIMARY_NAME])), false);
+        let handle = handle(&recursor);
+        let pool = NameServerPool::from_nameservers(
+            vec![
+                handle.cached_name_server(&NameServerConfig::udp_and_tcp(PLAIN)),
+                handle.cached_name_server(&NameServerConfig::tls(PRIMARY, Arc::from(PRIMARY_NAME))),
+                handle.cached_name_server(&handle.name_server_config(PRIMARY)),
+            ],
+            handle.pool_context.clone(),
+        )
+        .with_required_authentication();
+        good(
+            &pool
+                .lookup(query("host.bound.test."), DnsRequestOptions::default())
+                .first_answer()
+                .await
+                .unwrap(),
+        );
+        assert!(!provider.called(PLAIN));
+        assert_doq_only(&provider);
+    }
+
+    #[tokio::test]
+    async fn quic_referrals_and_glueless_dependencies_remain_authenticated() {
+        for glueless in [false, true] {
+            for opportunistic in [false, true] {
+                let provider = Provider::new(move |ip, request| hierarchy(ip, request, glueless));
+                let recursor = resolver(&provider, referral_policy(), opportunistic);
+                good(&lookup(&recursor, "probe.bound.test.").await.unwrap());
+                for ip in [ROOT, PRIMARY, SECONDARY] {
+                    assert!(provider.called(ip));
+                }
+                if glueless {
+                    assert!(
+                        provider
+                            .state
+                            .queries
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|(ip, q)| *ip == PRIMARY
+                                && q.name == name("ns.secondary.test.")
+                                && q.query_type == RecordType::A)
+                    );
+                }
+                assert_doq_only(&provider);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quic_referral_authentication_fails_closed_at_every_hop() {
+        for failed in [ROOT, PRIMARY, SECONDARY] {
+            let provider = Provider::new(|ip, request| hierarchy(ip, request, false));
+            provider.fail(failed, Failure::Certificate);
+            let recursor = resolver(&provider, referral_policy(), true);
+            assert!(
+                lookup(&recursor, "probe.bound.test.")
+                    .await
+                    .unwrap_err()
+                    .is_security_failure()
+            );
+            assert_doq_only(&provider);
+        }
+    }
+
+    #[tokio::test]
+    async fn quic_referrals_reject_wrong_names_and_unknown_addresses() {
+        for (ns, ip) in [("attacker.test", SECONDARY), (SECONDARY_NAME, PLAIN)] {
+            let provider = Provider::new(move |ip_, request| {
+                if ip_ == PRIMARY && request.queries[0].name == name("bound.test.") {
+                    delegation(request, "bound.test.", ns, Some(ip))
+                } else {
+                    hierarchy(ip_, request, false)
+                }
+            });
+            assert!(
+                lookup(
+                    &resolver(&provider, referral_policy(), false),
+                    "probe.bound.test."
+                )
+                .await
+                .unwrap_err()
+                .is_security_failure()
+            );
+            assert!(!provider.called(SECONDARY));
+            assert!(!provider.called(PLAIN));
+            assert_doq_only(&provider);
+        }
+    }
+
+    #[tokio::test]
+    async fn quic_cname_dependencies_use_the_authenticated_target_binding() {
+        let provider = Provider::new(alias_reply("target.child.bound.test.", true));
+        let recursor = resolver(
+            &provider,
+            policy(serde_json::json!([
+                {"name":"bound.test","servers":[PRIMARY_NAME]},
+                {"name":"child.bound.test","servers":[SECONDARY_NAME]},
+            ])),
+            true,
+        );
+        good(&lookup(&recursor, "alias.bound.test.").await.unwrap());
+        assert!(provider.called(SECONDARY));
+        assert!(!provider.called(ROOT));
+        assert_doq_only(&provider);
+    }
+
+    #[tokio::test]
+    async fn quic_does_not_reuse_weak_or_differently_trusted_connections() {
+        for protocol in [Protocol::Udp, Protocol::Tls, Protocol::Quic] {
+            let provider = Provider::new(response);
+            let recursor = resolver(&provider, policy(binding(&[PRIMARY_NAME])), true);
+            let handle = handle(&recursor);
+            let config = handle.name_server_config(PRIMARY);
+            let original = handle.cached_name_server(&config);
+            assert!(!Arc::ptr_eq(
+                &original,
+                &handle
+                    .cached_name_server(&NameServerConfig::tls(PRIMARY, Arc::from(PRIMARY_NAME)))
+            ));
+            let server = Arc::new(NameServer::new(
+                [(
+                    protocol,
+                    Connection {
+                        ip: PLAIN,
+                        state: provider.state.clone(),
+                    },
+                )],
+                config,
+                &handle.pool_context.options,
+                provider.clone(),
+            ));
+            let pool =
+                NameServerPool::from_nameservers(vec![server.clone()], handle.pool_context.clone())
+                    .with_required_authentication();
+            for name in ["one.bound.test.", "two.bound.test."] {
+                good(
+                    &pool
+                        .lookup(query(name), DnsRequestOptions::default())
+                        .first_answer()
+                        .await
+                        .unwrap(),
+                );
+            }
+            assert_eq!(provider.state.calls.lock().unwrap().len(), 1);
+            let cx = Arc::new(
+                PoolContext::new(
+                    handle.pool_context.options.clone(),
+                    TlsConfig::new().unwrap(),
+                )
+                .with_server_tls_config(
+                    PRIMARY,
+                    Arc::from(PRIMARY_NAME),
+                    Protocol::Quic,
+                    client_tls(ROGUE),
+                ),
+            );
+            let pool =
+                NameServerPool::from_nameservers(vec![server], cx).with_required_authentication();
+            good(
+                &pool
+                    .lookup(query("three.bound.test."), DnsRequestOptions::default())
+                    .first_answer()
+                    .await
+                    .unwrap(),
+            );
+            let calls = provider.state.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_ne!(calls[0].identity, calls[1].identity);
+            assert!(
+                !provider
+                    .state
+                    .queries
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(ip, _)| *ip == PLAIN)
+            );
+            drop(calls);
+            assert_doq_only(&provider);
+        }
+    }
+
+    #[test]
+    fn same_endpoint_cannot_require_conflicting_dot_and_doq_policies() {
+        let mut config = policy(binding(&[PRIMARY_NAME]));
+        let mut duplicate = config["servers"][0].clone();
+        duplicate["protocol"] = serde_json::json!("doq");
+        config["servers"].as_array_mut().unwrap().push(duplicate);
+        assert!(
+            ForcedEncryptedAuthoritativePolicy::try_from(
+                serde_json::from_value::<ForcedEncryptedAuthoritativeConfig>(config).unwrap()
+            )
+            .is_err()
+        );
+    }
+}
